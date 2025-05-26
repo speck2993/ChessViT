@@ -300,12 +300,43 @@ def evaluate_model(model: ViTChess, device: torch.device,
                    outputs['contrastive_cls_hv_flip'].shape[0] == cls_orig_eval.shape[0]:
                     loss_contrast_flip_hv = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_hv_flip'], temperature=nt_xent_temperature)
 
-                # Source contrastive for evaluation (requires careful handling of batch content)
-                # This part is tricky for evaluation as a single batch might not have both sources.
-                # For simplicity, we'll only compute if a hypothetical cross-source batch was formed.
-                # Or, more realistically, we acknowledge this component might be zero during typical eval.
-                # For now, let's assume it's zero in eval or would need specific eval batches.
-                # We will log its individual component as 0 if not computed.
+                # Cross-source NT-Xent loss - Modified for true source flag toggle
+                if cls_orig_eval.shape[0] > 0:
+                    # Get original bitboards and flags from the batch, ensure they are on the correct device
+                    # These are already prepared in default_flags_kwargs and batch
+                    
+                    # Prepare inputs for get_early_block_cls_features
+                    bb_for_toggle = batch['bitboards'] # Already on device
+                    is960_for_toggle = default_flags_kwargs['is960']
+                    stm_for_toggle = default_flags_kwargs['stm']
+                    rep1_for_toggle = default_flags_kwargs['rep1']
+                    rep2_for_toggle = default_flags_kwargs['rep2']
+                    
+                    is_lichess_actual = default_flags_kwargs['is_lichess']
+                    # Create toggled is_lichess flags (0.0 -> 1.0, 1.0 -> 0.0)
+                    # Ensure it's a float tensor for multiplication with bias later
+                    is_lichess_toggled = 1.0 - is_lichess_actual.float() 
+
+                    # Get embeddings with the source flag toggled
+                    # The model.get_early_block_cls_features will handle internal .float() for flags
+                    cls_toggled = model.get_early_block_cls_features(
+                        bb_for_toggle,
+                        is960_for_toggle,
+                        stm_for_toggle,
+                        rep1_for_toggle,
+                        rep2_for_toggle,
+                        is_lichess_toggled 
+                    )
+
+                    if cls_toggled.shape[0] == cls_orig_eval.shape[0]:
+                        loss_contrast_source = nt_xent_loss_fn(cls_orig_eval, cls_toggled, temperature=nt_xent_temperature)
+                        individual_nt_xent_losses['contrastive_source'] = loss_contrast_source.item()
+                    else:
+                        # This case should ideally not happen if batch sizes are consistent
+                        print(f"Warning: Mismatch in shapes for source contrastive loss. cls_orig: {cls_orig_eval.shape}, cls_toggled: {cls_toggled.shape}")
+                        individual_nt_xent_losses['contrastive_source'] = 0.0
+                else:
+                    individual_nt_xent_losses['contrastive_source'] = 0.0 # Batch size 0 or cls_orig is empty
 
             # Weighted average of contrastive losses for evaluation
             # For evaluation, this is more for consistent logging. The actual values depend on whether flipped boards were passed.
@@ -633,33 +664,43 @@ def main(config_path: str):
                     loss_contrast_flip_hv = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_hv_flip'], temperature=nt_temperature)
                     individual_nt_xent_losses['contrastive_hv'] = loss_contrast_flip_hv.item()
 
-                # Cross-source NT-Xent loss
-                is_lichess_flags = batch.get('is_lichess_game')
-                if is_lichess_flags is not None and cls_orig.shape[0] > 0:
-                    lichess_indices = torch.where(is_lichess_flags == 1)[0]
-                    lc0_indices = torch.where(is_lichess_flags == 0)[0]
+                # Cross-source NT-Xent loss - Modified for true source flag toggle
+                if cls_orig.shape[0] > 0:
+                    # Get original bitboards and flags from the batch, ensure they are on the correct device
+                    # These are already prepared in default_flags_kwargs and batch
+                    
+                    # Prepare inputs for get_early_block_cls_features
+                    bb_for_toggle = batch['bitboards'] # Already on device
+                    is960_for_toggle = default_flags_kwargs['is960']
+                    stm_for_toggle = default_flags_kwargs['stm']
+                    rep1_for_toggle = default_flags_kwargs['rep1']
+                    rep2_for_toggle = default_flags_kwargs['rep2']
+                    
+                    is_lichess_actual = default_flags_kwargs['is_lichess']
+                    # Create toggled is_lichess flags (0.0 -> 1.0, 1.0 -> 0.0)
+                    # Ensure it's a float tensor for multiplication with bias later
+                    is_lichess_toggled = 1.0 - is_lichess_actual.float() 
 
-                    if len(lichess_indices) > 0 and len(lc0_indices) > 0:
-                        # Sample min_len from both to create pairs
-                        min_len = min(len(lichess_indices), len(lc0_indices))
-                        
-                        # Randomly sample `min_len` indices from both Lichess and Lc0 embeddings
-                        # Ensure sampling is done on the device of the indices tensor
-                        perm_lichess = torch.randperm(len(lichess_indices), device=lichess_indices.device)[:min_len]
-                        perm_lc0 = torch.randperm(len(lc0_indices), device=lc0_indices.device)[:min_len]
-                        
-                        sampled_lichess_indices = lichess_indices[perm_lichess]
-                        sampled_lc0_indices = lc0_indices[perm_lc0]
-                        
-                        cls_lichess = cls_orig[sampled_lichess_indices]
-                        cls_lc0 = cls_orig[sampled_lc0_indices]
-                        
-                        loss_contrast_source = nt_xent_loss_fn(cls_lichess, cls_lc0, temperature=nt_temperature)
+                    # Get embeddings with the source flag toggled
+                    # The model.get_early_block_cls_features will handle internal .float() for flags
+                    cls_toggled = model.get_early_block_cls_features(
+                        bb_for_toggle,
+                        is960_for_toggle,
+                        stm_for_toggle,
+                        rep1_for_toggle,
+                        rep2_for_toggle,
+                        is_lichess_toggled 
+                    )
+
+                    if cls_toggled.shape[0] == cls_orig.shape[0]:
+                        loss_contrast_source = nt_xent_loss_fn(cls_orig, cls_toggled, temperature=nt_temperature)
                         individual_nt_xent_losses['contrastive_source'] = loss_contrast_source.item()
                     else:
-                        individual_nt_xent_losses['contrastive_source'] = 0.0 # Ensure key exists if no pairs
+                        # This case should ideally not happen if batch sizes are consistent
+                        print(f"Warning: Mismatch in shapes for source contrastive loss. cls_orig: {cls_orig.shape}, cls_toggled: {cls_toggled.shape}")
+                        individual_nt_xent_losses['contrastive_source'] = 0.0
                 else:
-                    individual_nt_xent_losses['contrastive_source'] = 0.0 # Ensure key exists if flags missing
+                    individual_nt_xent_losses['contrastive_source'] = 0.0 # Batch size 0 or cls_orig is empty
 
                 # Calculate weighted average for the 'contrastive' loss component
                 # Weights: 1 for each flip (v,h,hv), 3 for source

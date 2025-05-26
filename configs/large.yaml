@@ -1,0 +1,59 @@
+model:
+  dim:                   1024
+  depth:                 16
+  early_depth:           4
+  heads:                 16
+  distance_matrix_path:  dist_init.npy
+  freeze_distance_iters: 50000
+  pool_every_k_blocks: 3
+  cls_dropout_rate: 0.05
+  cls_pool_alpha_requires_grad: true
+  cls_pool_alpha_init: 1.0
+  policy_head_conv_dim: 1024
+  policy_head_mlp_hidden_dim: 2048
+  num_policy_planes: 73
+  drop_path: 0.1
+
+loss_weights:
+  policy:           1.0
+  value:            1.5
+  moves_left:       0.2
+  auxiliary_value:  0.2   # early‐group WDL head
+  material:         0.1
+  contrastive:      0.15  # cosine loss on CLS features
+
+optimiser:
+  type:             adamw
+  lr:               1.5e-4
+  weight_decay:     1e-2
+  betas:            [0.9, 0.95]
+  sched:            cosine
+  warmup_steps:     1500
+
+dataset:
+  raw_data_dir:     data
+  batch_size:       128
+  grad_accum:       1
+  num_workers:      4
+  flips:            true
+  type:             tensor
+  tensor_glob_pattern: '**/*.npz'
+
+runtime:
+  device:           cuda
+  precision:        fp16
+  grad_accum:       2
+  max_steps:        4200000
+  log_every:        500
+  ckpt_every:       50000
+  checkpoint_format: safetensors
+  gradient_clip_norm: 1.0   # global‐norm
+
+logging:
+  output_dir:       ./runs/v1/large
+  tensorboard:      true
+  matplotlib:       true
+  wandb:            false
+
+rolling_metrics:
+  window_size:      1000

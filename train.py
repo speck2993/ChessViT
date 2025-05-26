@@ -726,38 +726,45 @@ def main(config_path: str):
             metrics['compare_lc0'].append(compare_lc0.item())
 
             # Logging
-            if writer and (step + 1) % log_every == 0:
-                # Compute mean rolling metrics
+            if (step + 1) % log_every == 0:
                 mean_metrics = {name: np.mean(metrics[name]) for name in metric_names}
-                mean_data_loading_time = np.mean(data_loading_times) # Calculate mean data loading time
-                # Record history
-                for name, val in mean_metrics.items():
-                    loss_history[name]['train'].append(val)
-                    loss_history[name]['steps_train'].append(step + 1)
-                    writer.add_scalar(f'train/{name}', val, step + 1)
-                
-                # Log alpha values for CLS pooling if they exist
+                mean_data_loading_time = np.mean(data_loading_times)
                 alpha_log_str = ""
-                if hasattr(model, 'alphas') and model.alphas:
-                    alpha_values = []
-                    for i, alpha_param in enumerate(model.alphas):
-                        writer.add_scalar(f'alpha_pool_{i}', alpha_param.item(), step + 1)
-                        alpha_values.append(f'{alpha_param.item():.3f}')
-                    alpha_log_str = f", alphas: [{', '.join(alpha_values)}]"
 
-                # Plot matplotlib PNG
-                if cfg['logging']['matplotlib']:
-                    plot_all_losses(loss_history, val_steps_history, cfg['logging']['output_dir'])
-                # Throughput
+                if writer: # TensorBoard specific logging
+                    for name, val in mean_metrics.items():
+                        loss_history[name]['train'].append(val)
+                        loss_history[name]['steps_train'].append(step + 1)
+                        writer.add_scalar(f'train/{name}', val, step + 1)
+                    
+                    if hasattr(model, 'alphas') and model.alphas:
+                        alpha_values_tb = [] # Separate for tb if needed, though string is fine
+                        for i, alpha_param in enumerate(model.alphas):
+                            writer.add_scalar(f'alpha_pool_{i}', alpha_param.item(), step + 1)
+                            alpha_values_tb.append(f'{alpha_param.item():.3f}')
+                        # alpha_log_str could be formed here if needed only for tb log line
+
+                # Console logging (always happens if log_every condition met)
+                if hasattr(model, 'alphas') and model.alphas: # Recalculate alpha_log_str for console if needed
+                    alpha_values_console = [f'{alpha_param.item():.3f}' for alpha_param in model.alphas]
+                    alpha_log_str = f", alphas: [{', '.join(alpha_values_console)}]"
+                
                 current_time = time.time()
                 delta_steps = (step + 1) - last_log_step
                 positions = delta_steps * ds_cfg['batch_size']
                 elapsed = current_time - last_log_time
                 throughput = positions / elapsed if elapsed > 0 else float('inf')
-                # Print rolling total loss and throughput
+                
                 print(f"[Step {step+1}/{rt['max_steps']}] total_loss: {mean_metrics['total']:.4f}, lc0_loss: {mean_metrics['compare_lc0']:.4f}, policy: {mean_metrics['policy']:.4f}, value: {mean_metrics['value']:.4f}, moves_left: {mean_metrics['moves_left']:.4f}, auxiliary_value: {mean_metrics['auxiliary_value']:.4f}, material: {mean_metrics['material']:.4f}, contrastive_avg: {mean_metrics.get('contrastive', 0.0):.4f} (v:{mean_metrics.get('contrastive_v',0.0):.2f}, h:{mean_metrics.get('contrastive_h',0.0):.2f}, hv:{mean_metrics.get('contrastive_hv',0.0):.2f}, src:{mean_metrics.get('contrastive_source',0.0):.2f}), {throughput:.1f} positions/sec, data_load_time: {mean_data_loading_time:.4f}s{alpha_log_str}", flush=True)
+                
                 last_log_time = current_time
                 last_log_step = step + 1
+
+                # Plot matplotlib PNG (conditional on config and writer for consistency, or make independent)
+                # If matplotlib is meant to be independent of tensorboard, this also needs adjustment.
+                # For now, keeping it conditional on tensorboard for simplicity of this change.
+                if writer and cfg['logging']['matplotlib']:
+                    plot_all_losses(loss_history, val_steps_history, cfg['logging']['output_dir'])
 
             # Validation step
             if (step + 1) % val_every == 0:

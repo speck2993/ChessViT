@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ChessViT: A Vision Transformer for Chess
 
 ## Overview
@@ -154,3 +155,6 @@ This script creates dummy PGN files, runs `preprocess_tensors.py` on them with m
 ---
 
 This README provides a general guide. You might need to adjust paths, parameters, and commands based on your specific setup and dataset. 
+=======
+# ChessViT
+>>>>>>> origin/main

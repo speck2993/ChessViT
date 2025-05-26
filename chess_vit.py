@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, List
 from safetensors.torch import load_file
 import numpy as np
 import yaml
@@ -31,7 +31,7 @@ class Mlp(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
-        x = self.act(x)
+        x = F.gelu(x, approximate='tanh')  # Faster GELU approximation
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
@@ -41,8 +41,9 @@ class MultiHeadSelfAttention(nn.Module):
     """Standard MHSA with optional additive bias‑matrix (65×65).
 
     Args:
-        bias (torch.Tensor | None): 65×65 distance matrix.  Registered as a
+        bias (torch.Tensor | None): 65×65 distance matrix. Registered as a
             *parameter* so it can be frozen / unfrozen via .requires_grad_.
+            For per-head bias, this initial bias will be repeated for each head.
         bias_scale (float): Scalar scale that is *always* trainable (helps the
             optimiser learn whether to trust the bias or not).
     """
@@ -58,26 +59,59 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Bias handling ------------------------------------------------------
         if bias is None:
-            bias = torch.zeros(65, 65)
-        self.bias = nn.Parameter(bias)               # caller decides .requires_grad
+            # Initialize as (heads, 65, 65)
+            initial_bias_data = torch.zeros(heads, 65, 65)
+        else:
+            # Repeat the provided (65,65) bias for each head
+            initial_bias_data = bias.unsqueeze(0).repeat(heads, 1, 1)
+        
+        self.bias = nn.Parameter(initial_bias_data) # Shape: (heads, 65, 65)
+                                                    # Caller decides .requires_grad for the initial state
         self.bias_scale = nn.Parameter(torch.tensor(1.0))  # *always* learnable
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
+        
+        # Check if we can use Flash Attention (requires PyTorch 2.0+)
+        try:
+            from torch.nn.functional import scaled_dot_product_attention
+            USE_FLASH = True
+        except ImportError:
+            USE_FLASH = False
+        
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn + self.bias_scale * self.bias[:N, :N]   # trim to sequence‑len
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
+        # Use Flash Attention if available and no bias is needed
+        if USE_FLASH and (self.bias is None or torch.all(self.bias == 0)):
+            # Flash Attention path - much faster
+            x = scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=None,
+                dropout_p=0.0,
+                scale=self.scale
+            )
+            x = x.transpose(1, 2).reshape(B, N, C)
+        else:
+            # Original implementation for cases with bias
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            
+            # Apply per-head bias if it exists
+            if self.bias is not None:
+                head_biases = self.bias[:, :N, :N].unsqueeze(0)
+                attn = attn + self.bias_scale * head_biases
+            
+            attn = attn.softmax(dim=-1)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
         return self.proj(x)
 
 class Block(nn.Module):
     """Transformer encoder block (LN → MHSA → LN → MLP)."""
-    def __init__(self, dim: int, heads: int, drop_path: float):
+    def __init__(self, dim: int, heads: int, drop_path: float, bias: Optional[torch.Tensor] = None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn  = MultiHeadSelfAttention(dim, heads)
+        self.attn  = MultiHeadSelfAttention(dim, heads, bias=bias)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp   = Mlp(dim)
         self.dp    = nn.Identity() if drop_path == 0 else DropPath(drop_path)
@@ -137,6 +171,8 @@ class ViTChess(nn.Module):
         # New parameters for the enhanced policy head
         policy_head_conv_dim: int = 128,       # Number of channels for intermediate policy conv layers
         policy_head_mlp_hidden_dim: int = 256, # Hidden dim for the CLS bias MLP in policy head
+        # Added for consistency, though not strictly needed for ViTChess itself if defaults match
+        dim_head: Optional[int] = None, # Will be dim // heads if None
     ):
         super().__init__()
         if early_depth >= depth: # early_depth is count of blocks, so index is early_depth-1
@@ -160,15 +196,16 @@ class ViTChess(nn.Module):
         self.stm_bias      = nn.Parameter(torch.randn(1, 1, dim) * 0.02)  # flag bias for side-to-move
         self.rep1_bias     = nn.Parameter(torch.randn(1, 1, dim) * 0.02)  # flag bias for repetition >=1
         self.rep2_bias     = nn.Parameter(torch.randn(1, 1, dim) * 0.02)  # flag bias for repetition >=2
+        self.lichess_source_bias = nn.Parameter(torch.randn(1, 1, dim) * 0.02) # Learnable flag for Lichess source
 
         # --- Transformer encoder (Unified blocks) -------------------
         self.blocks = nn.ModuleList()
         dp_rates = torch.linspace(0, drop_path, steps=depth)
         for i in range(depth):
-            blk = Block(dim, heads, dp_rates[i].item())
-            if distance_matrix is not None:
-                blk.attn.bias.data = distance_matrix.clone().float()
-            blk.attn.bias.requires_grad = not freeze_distance
+            blk = Block(dim, heads, dp_rates[i].item(), bias=distance_matrix)
+            
+            if distance_matrix is not None and blk.attn.bias is not None:
+                blk.attn.bias.requires_grad = not freeze_distance
             self.blocks.append(blk)
 
         self.norm_early = nn.LayerNorm(dim) # Norm after early_depth blocks for early heads
@@ -195,9 +232,9 @@ class ViTChess(nn.Module):
 
         # --- New Policy Head Architecture ---
         self.policy_conv1 = nn.Conv2d(dim, policy_head_conv_dim, kernel_size=3, padding=1)
-        self.policy_gelu1 = nn.GELU()
+        self.policy_gelu1 = lambda x: F.gelu(x, approximate='tanh')
         self.policy_conv2 = nn.Conv2d(policy_head_conv_dim, policy_head_conv_dim, kernel_size=3, padding=1)
-        self.policy_gelu2 = nn.GELU()
+        self.policy_gelu2 = lambda x: F.gelu(x, approximate='tanh')
 
         # MLP for CLS token bias
         # Input dim: policy_head_conv_dim (from patch features) + dim (from CLS token)
@@ -217,13 +254,15 @@ class ViTChess(nn.Module):
     def freeze_distance_bias(self, freeze: bool = True):
         """Convenience toggle after initial warm‑up for ALL blocks."""
         for blk in self.blocks: # Updated to self.blocks
-            blk.attn.bias.requires_grad = not freeze
+            if hasattr(blk.attn, 'bias') and blk.attn.bias is not None:
+                blk.attn.bias.requires_grad = not freeze
 
     def get_early_block_cls_features(self, bitboards: torch.Tensor,
-                                       is960: Optional[torch.Tensor] = None,
-                                       stm: Optional[torch.Tensor] = None,
-                                       rep1: Optional[torch.Tensor] = None,
-                                       rep2: Optional[torch.Tensor] = None):
+                                       is960: torch.Tensor,
+                                       stm: torch.Tensor,
+                                       rep1: torch.Tensor,
+                                       rep2: torch.Tensor,
+                                       is_lichess: torch.Tensor):
         """Helper to get CLS token features up to early_depth, for contrastive loss on flipped boards."""
         B = bitboards.size(0)
         x = self.patch_embed(bitboards)      # (B, dim, 8, 8)
@@ -231,16 +270,11 @@ class ViTChess(nn.Module):
 
         cls = self.cls_token.expand(B, -1, -1)       # (B, 1, dim)
         # Apply global flag biases
-        if is960 is not None:
-            cls = cls + is960.view(-1, 1, 1).float() * self.chess960_bias
-        if stm is not None:
-            # Convert stm flag to +1 for White, -1 for Black
-            stm_sign = stm.float() * 2.0 - 1.0
-            cls = cls + stm_sign.view(-1, 1, 1) * self.stm_bias
-        if rep1 is not None:
-            cls = cls + rep1.view(-1, 1, 1).float() * self.rep1_bias
-        if rep2 is not None:
-            cls = cls + rep2.view(-1, 1, 1).float() * self.rep2_bias
+        cls = cls + is960.view(-1, 1, 1).float() * self.chess960_bias
+        cls = cls + stm.view(-1, 1, 1).float() * 2.0 * self.stm_bias - self.stm_bias
+        cls = cls + rep1.view(-1, 1, 1).float() * self.rep1_bias
+        cls = cls + rep2.view(-1, 1, 1).float() * self.rep2_bias
+        cls = cls + is_lichess.view(-1, 1, 1).float() * self.lichess_source_bias
 
         x = torch.cat([cls, x], dim=1)               # (B, 65, dim)
         x = x + self.pos_embed                       # Add pos-emb after concat
@@ -258,23 +292,99 @@ class ViTChess(nn.Module):
         # Apply dropout again, consistent with how early_cls is derived in forward pass for heads
         return self.cls_dropout(cls_token_early_norm)
 
+    def forward_batch_contrastive(self, bitboards_list: List[torch.Tensor], 
+                              is960_list: List[torch.Tensor],
+                              stm_list: List[torch.Tensor],
+                              rep1: torch.Tensor,
+                              rep2: torch.Tensor,
+                              is_lichess: torch.Tensor):
+        """
+        Efficient batched forward pass for multiple board variants.
+        
+        Args:
+            bitboards_list: List of [original, v_flip, h_flip, hv_flip] tensors
+            is960_list: List of is960 flags for each variant
+            stm_list: List of side-to-move flags for each variant
+            rep1, rep2, is_lichess: Same for all variants
+        
+        Returns:
+            List of CLS features for each variant
+        """
+        # Stack all variants into a single batch
+        all_bitboards = torch.cat(bitboards_list, dim=0)
+        B_per_variant = bitboards_list[0].size(0)
+        num_variants = len(bitboards_list)
+        total_B = B_per_variant * num_variants
+        
+        # Patch embed all at once
+        x = self.patch_embed(all_bitboards)  # (total_B, dim, 8, 8)
+        x = x.flatten(2).transpose(1, 2)     # (total_B, 64, dim)
+        
+        # Create CLS tokens for all variants
+        cls = self.cls_token.expand(total_B, -1, -1)  # (total_B, 1, dim)
+        
+        # Apply variant-specific biases
+        if is960_list is not None:
+            is960_all = torch.cat(is960_list, dim=0)
+            cls = cls + is960_all.view(-1, 1, 1).float() * self.chess960_bias
+        
+        if stm_list is not None:
+            stm_all = torch.cat(stm_list, dim=0)
+            stm_sign = stm_all.float() * 2.0 - 1.0
+            cls = cls + stm_sign.view(-1, 1, 1) * self.stm_bias
+        
+        # Apply shared biases (same for all variants)
+        if rep1 is not None:
+            rep1_expanded = rep1.repeat(num_variants)
+            cls = cls + rep1_expanded.view(-1, 1, 1).float() * self.rep1_bias
+        
+        if rep2 is not None:
+            rep2_expanded = rep2.repeat(num_variants)
+            cls = cls + rep2_expanded.view(-1, 1, 1).float() * self.rep2_bias
+        
+        if is_lichess is not None:
+            is_lichess_expanded = is_lichess.repeat(num_variants)
+            cls = cls + is_lichess_expanded.view(-1, 1, 1).float() * self.lichess_source_bias
+        
+        # Concatenate and add positional embeddings
+        x = torch.cat([cls, x], dim=1)  # (total_B, 65, dim)
+        x = x + self.pos_embed
+        
+        # Process through early blocks
+        for i in range(self.early_depth_count):
+            cls_input, patches_input = x[:, :1], x[:, 1:]
+            cls_dropped = self.cls_dropout(cls_input)
+            x_for_block = torch.cat([cls_dropped, patches_input], dim=1)
+            x = self.blocks[i](x_for_block)
+        
+        # Extract and normalize CLS features
+        x_norm_early = self.norm_early(x)
+        cls_features = self.cls_dropout(x_norm_early[:, 0])  # (total_B, dim)
+        
+        # Split back into separate variants
+        cls_features_list = cls_features.chunk(num_variants, dim=0)
+        
+        return cls_features_list
+
     # ---------------------------------------------------------------------
     # forward
     # ---------------------------------------------------------------------
     def forward(self, bitboards: torch.Tensor, *,
-                is960: Optional[torch.Tensor] = None,
-                stm: Optional[torch.Tensor] = None,
-                rep1: Optional[torch.Tensor] = None,
-                rep2: Optional[torch.Tensor] = None,
+                is960: torch.Tensor,
+                stm: torch.Tensor,
+                rep1: torch.Tensor,
+                rep2: torch.Tensor,
+                is_lichess: torch.Tensor,
                 flipped_bitboards_v: Optional[torch.Tensor] = None,
                 flipped_bitboards_h: Optional[torch.Tensor] = None,
                 flipped_bitboards_hv: Optional[torch.Tensor] = None):
         """Args:
             bitboards: (B, 14, 8, 8) float16/32.
-            is960: (B,) bool/float — 1 if starting position is Chess960.
-            stm: (B,) bool/float — 1 if side to move is White.
-            rep1: (B,) bool/float — 1 if repetition count >= 1.
-            rep2: (B,) bool/float — 1 if repetition count >= 2.
+            is960: (B,) float tensor — 1 if starting position is Chess960.
+            stm: (B,) float tensor — 1 if side to move is White.
+            rep1: (B,) float tensor — 1 if repetition count >= 1.
+            rep2: (B,) float tensor — 1 if repetition count >= 2.
+            is_lichess: (B,) float tensor - 1 if from Lichess source.
             flipped_bitboards_v: Optional (B, 14, 8, 8) vertically flipped.
             flipped_bitboards_h: Optional (B, 14, 8, 8) horizontally flipped.
             flipped_bitboards_hv: Optional (B, 14, 8, 8) both H & V flipped.
@@ -282,36 +392,47 @@ class ViTChess(nn.Module):
         outputs = {}
 
         # --- Process flipped boards for contrastive loss (early blocks only) ---
+        contrastive_variants = [bitboards]
+        # Ensure inputs are float for consistent processing
+        f_is960 = is960.float()
+        f_stm = stm.float()
+
+        is960_variants = [f_is960]
+        stm_variants = [f_stm]
+
         if flipped_bitboards_v is not None:
-            # Vertical flip: toggle side-to-move, keep is960, rep1, rep2
-            is960_v = is960
-            stm_v = stm
-            if stm is not None:
-                # Cast bool to float before subtraction
-                stm_v = 1.0 - stm.float()
-            outputs["contrastive_cls_v_flip"] = self.get_early_block_cls_features(
-                flipped_bitboards_v, is960_v, stm_v, rep1, rep2
-            )
+            contrastive_variants.append(flipped_bitboards_v)
+            is960_variants.append(f_is960)  # is960 same for v_flip
+            stm_variants.append(1.0 - f_stm)  # Toggle STM
+
         if flipped_bitboards_h is not None:
-            # Horizontal flip: keep side-to-move, treat as Chess960 variant, keep rep1, rep2
-            is960_h = None
-            if is960 is not None:
-                # horizontal flip not valid in standard chess => force Chess960
-                is960_h = torch.ones_like(is960)
-            outputs["contrastive_cls_h_flip"] = self.get_early_block_cls_features(
-                flipped_bitboards_h, is960_h, stm, rep1, rep2
-            )
+            contrastive_variants.append(flipped_bitboards_h)
+            is960_variants.append(torch.ones_like(f_is960))  # Force 960
+            stm_variants.append(f_stm)  # stm same for h_flip
+
         if flipped_bitboards_hv is not None:
-            # Horizontal+vertical flip: treat as Chess960, toggle side-to-move
-            is960_hv = None
-            if is960 is not None:
-                is960_hv = torch.ones_like(is960)
-            stm_hv = stm
-            if stm is not None:
-                # Cast bool to float before subtraction
-                stm_hv = 1.0 - stm.float()
-            outputs["contrastive_cls_hv_flip"] = self.get_early_block_cls_features(
-                flipped_bitboards_hv, is960_hv, stm_hv, rep1, rep2
+            contrastive_variants.append(flipped_bitboards_hv)
+            is960_variants.append(torch.ones_like(f_is960))  # Force 960
+            stm_variants.append(1.0 - f_stm)  # Toggle STM
+
+        if len(contrastive_variants) > 1:
+            cls_features_all = self.forward_batch_contrastive(
+                contrastive_variants, is960_variants, stm_variants, 
+                rep1, rep2, is_lichess
+            )
+            outputs["early_cls"] = cls_features_all[0]
+            current_idx = 1
+            if flipped_bitboards_v is not None:
+                outputs["contrastive_cls_v_flip"] = cls_features_all[current_idx]
+                current_idx += 1
+            if flipped_bitboards_h is not None:
+                outputs["contrastive_cls_h_flip"] = cls_features_all[current_idx]
+                current_idx += 1
+            if flipped_bitboards_hv is not None:
+                outputs["contrastive_cls_hv_flip"] = cls_features_all[current_idx]
+        else: # Only original board, no flips
+            outputs["early_cls"] = self.get_early_block_cls_features(
+                bitboards, is960, stm, rep1, rep2, is_lichess
             )
 
         # --- Main Path: Initial Embedding & Positional Encoding ------------
@@ -323,16 +444,11 @@ class ViTChess(nn.Module):
 
         cls = self.cls_token.expand(B, -1, -1)       # (B, 1, dim)
         # Add global flag biases
-        if is960 is not None:
-            cls = cls + is960.view(-1, 1, 1).float() * self.chess960_bias
-        if stm is not None:
-            # Convert stm flag to +1 for White, -1 for Black
-            stm_sign = stm.float() * 2.0 - 1.0
-            cls = cls + stm_sign.view(-1, 1, 1) * self.stm_bias
-        if rep1 is not None:
-            cls = cls + rep1.view(-1, 1, 1).float() * self.rep1_bias
-        if rep2 is not None:
-            cls = cls + rep2.view(-1, 1, 1).float() * self.rep2_bias
+        cls = cls + is960.view(-1, 1, 1).float() * self.chess960_bias
+        cls = cls + stm.view(-1, 1, 1).float() * 2.0 * self.stm_bias - self.stm_bias
+        cls = cls + rep1.view(-1, 1, 1).float() * self.rep1_bias
+        cls = cls + rep2.view(-1, 1, 1).float() * self.rep2_bias
+        cls = cls + is_lichess.view(-1, 1, 1).float() * self.lichess_source_bias
 
         x = torch.cat([cls, x], dim=1)               # (B, 65, dim)
         x = x + self.pos_embed                       # Add pos-emb
@@ -485,7 +601,9 @@ def load_model_from_checkpoint(
 
     # 3) load distance matrix
     dist_path = cfg['model']['distance_matrix_path']
-    distance_matrix = torch.from_numpy(np.load(dist_path)).float().to(device)
+    # The distance_matrix loaded here is (65,65). MultiHeadSelfAttention will expand it per head.
+    distance_matrix_numpy = np.load(dist_path)
+    distance_matrix = torch.from_numpy(distance_matrix_numpy).float() # Keep on CPU for now, model init will move to device
 
     # 4) build model with exactly the same args as in your training main()
     model = ViTChess(
@@ -494,8 +612,8 @@ def load_model_from_checkpoint(
         early_depth=cfg['model']['early_depth'],
         heads=cfg['model']['heads'],
         drop_path=cfg['model'].get('drop_path', 0.1),
-        distance_matrix=distance_matrix,
-        freeze_distance=True,
+        distance_matrix=distance_matrix, # Pass the (65,65) matrix
+        freeze_distance=True, # Initial state, can be changed later
         num_policy_planes=cfg['model'].get('num_policy_planes', 73),
         num_value_outputs=cfg['model'].get('num_value_outputs', 3),
         num_material_categories=cfg['model'].get('num_material_categories', 20),
@@ -508,6 +626,7 @@ def load_model_from_checkpoint(
         cls_dropout_rate=cfg['model'].get('cls_dropout_rate', 0.0),
         policy_head_conv_dim=cfg['model'].get('policy_head_conv_dim', 128),
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
+        dim_head=cfg['model'].get('dim_head'),
     )
     model.to(device)
 
@@ -550,10 +669,11 @@ if __name__ == "__main__":
     dummy_stm = torch.tensor([1, 0], dtype=torch.float)
     dummy_rep1 = torch.tensor([0, 1], dtype=torch.float)
     dummy_rep2 = torch.tensor([0, 1], dtype=torch.float)
+    dummy_is_lichess = torch.tensor([1, 0], dtype=torch.float) # Example Lichess flags
     
     # Test with only main inputs
     print("--- Test with main inputs only ---")
-    out = model(dummy_bitboards, is960=dummy_is960, stm=dummy_stm, rep1=dummy_rep1, rep2=dummy_rep2)
+    out = model(dummy_bitboards, is960=dummy_is960, stm=dummy_stm, rep1=dummy_rep1, rep2=dummy_rep2, is_lichess=dummy_is_lichess)
     for k, v in out.items():
         print(f"{k}: {v.shape}")
 
@@ -564,6 +684,7 @@ if __name__ == "__main__":
         dummy_bitboards,
         is960=dummy_is960,
         stm=dummy_stm, rep1=dummy_rep1, rep2=dummy_rep2,
+        is_lichess=dummy_is_lichess,
         flipped_bitboards_v=dummy_v_flip,
         # flipped_bitboards_h=dummy_v_flip, # Can use same for testing shape
         # flipped_bitboards_hv=dummy_v_flip # Can use same for testing shape

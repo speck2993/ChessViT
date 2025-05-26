@@ -41,6 +41,7 @@ from typing import Dict, List, Any
 import json
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -67,6 +68,24 @@ def flip_bitboards_torch(bitboards: torch.Tensor, mode: str = "v") -> torch.Tens
 # ---------------------------------------------------------------------------
 class ChunkMmapDataset(IterableDataset):
     """Iterates over 4 096‑position ``.npz`` *chunks* with zero‑copy slicing."""
+
+    @staticmethod
+    def _get_file_positions(file_path, root_dir):
+        """Helper to get position count from a single file."""
+        try:
+            num_positions = 0
+            with np.load(file_path, mmap_mode="r", allow_pickle=False) as npz:
+                if npz.files:
+                    num_positions = npz[npz.files[0]].shape[0]
+            return {
+                'path': file_path.relative_to(root_dir).as_posix(),
+                'mtime': file_path.stat().st_mtime,
+                'positions': num_positions,
+                'file_obj': file_path
+            }
+        except Exception as e:
+            print(f"Warning: Could not read {file_path}: {e}")
+            return None
 
     def __init__(
         self,
@@ -139,27 +158,34 @@ class ChunkMmapDataset(IterableDataset):
         self.total_positions_in_dataset = 0
         file_metadata_for_cache: List[Dict[str, Any]] = []
 
-        print(f"INFO: ChunkMmapDataset - Starting calculation of total positions from {len(current_files_on_disk)} files...")
-        for i, file_path in enumerate(current_files_on_disk):
-            try:
-                num_positions_in_file = 0
-                with np.load(file_path, mmap_mode="r", allow_pickle=False) as npz:
-                    if npz.files:
-                        num_positions_in_file = npz[npz.files[0]].shape[0]
-                
-                self.files.append(file_path) # Add the live Path object
-                self.total_positions_in_dataset += num_positions_in_file
-                
-                file_metadata_for_cache.append({
-                    'path': file_path.relative_to(self.root_dir).as_posix(), # Store relative path
-                    'mtime': file_path.stat().st_mtime,
-                    'positions': num_positions_in_file
-                })
+        # Parallel file loading
+        print(f"INFO: ChunkMmapDataset - Starting parallel calculation of total positions from {len(current_files_on_disk)} files...")
 
-                if (i + 1) % 100 == 0 or (i + 1) == len(current_files_on_disk):
-                    print(f"INFO: ChunkMmapDataset - Processed {i + 1}/{len(current_files_on_disk)} files for position count. Current total: {self.total_positions_in_dataset}", flush=True)
-            except Exception as e:
-                print(f"Warning: ChunkMmapDataset - Could not read or get position count from {file_path}: {e}", flush=True)
+        # Use ThreadPoolExecutor for parallel I/O
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count(), 8)) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(self._get_file_positions, f, self.root_dir): f 
+                for f in current_files_on_disk
+            }
+            
+            # Process completed tasks
+            completed = 0
+            for future in as_completed(future_to_file):
+                result = future.result()
+                if result:
+                    self.files.append(result['file_obj'])
+                    self.total_positions_in_dataset += result['positions']
+                    file_metadata_for_cache.append({
+                        'path': result['path'],
+                        'mtime': result['mtime'],
+                        'positions': result['positions']
+                    })
+                
+                completed += 1
+                if completed % 100 == 0 or completed == len(current_files_on_disk):
+                    print(f"INFO: ChunkMmapDataset - Processed {completed}/{len(current_files_on_disk)} files. "
+                          f"Current total: {self.total_positions_in_dataset}", flush=True)
         
         self._save_cache(file_glob, file_metadata_for_cache, self.total_positions_in_dataset)
         print(f"INFO: ChunkMmapDataset - Finished calculation. Total positions in dataset: {self.total_positions_in_dataset}")
@@ -328,18 +354,22 @@ def fast_chess_collate_fn(sample_list):
 # ---------------------------------------------------------------------------
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device, *, non_blocking: bool = True):
-    """Move all tensor values to *device* and create flipped bitboards."""
+    """Move all tensor values to device and create flipped bitboards using views where possible."""
     out: Dict[str, torch.Tensor] = {}
+    
+    # Move all tensors to device first
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
             out[k] = v.to(device, non_blocking=non_blocking)
         else:  # FEN strings, source_file_basename etc.
             out[k] = v
-
-    bb = out["bitboards"]
-    if bb.device.type == "cuda":  # flips are cheap on GPU; else CPU is fine
-        out["bitboards_v"] = flip_bitboards_torch(bb, "v")
-        out["bitboards_h"] = flip_bitboards_torch(bb, "h")
-        out["bitboards_hv"] = flip_bitboards_torch(bb, "hv")
-
+    
+    # Create flipped variants on GPU (these are views when possible)
+    bb = out.get("bitboards")
+    if bb is not None and bb.device.type == "cuda":
+        # Use flip which can sometimes create views instead of copies
+        out["bitboards_v"] = torch.flip(bb, dims=[-2])
+        out["bitboards_h"] = torch.flip(bb, dims=[-1])
+        out["bitboards_hv"] = torch.flip(bb, dims=[-2, -1])
+    
     return out

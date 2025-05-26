@@ -122,7 +122,9 @@ def make_dataset(
         num_workers=dl_num_workers,
         pin_memory=True,
         collate_fn=current_collate_fn,
-        persistent_workers=True if dl_num_workers > 0 else False
+        persistent_workers=True if dl_num_workers > 0 else False,
+        prefetch_factor=3 if dl_num_workers > 0 else None,
+        multiprocessing_context='spawn' if dl_num_workers > 0 else None
     )
     return loader
 
@@ -186,7 +188,9 @@ def plot_all_losses(loss_history_dict: Dict[str, Dict[str, Any]],
 def evaluate_model(model: ViTChess, device: torch.device,
                    data_source_dir: str, batch_size: int, num_workers: int,
                    tensor_glob_pattern: str, loss_weights_cfg: Dict,
-                   nt_xent_temperature: float, seed: Optional[int] = None) -> Dict[str, float]:
+                   nt_xent_temperature: float, seed: Optional[int] = None,
+                   # Add is_lichess_key for flexibility if the key name changes in dataset
+                   is_lichess_key: str = 'is_lichess_game') -> Dict[str, float]:
     """Evaluates the model on a given dataset and returns average losses."""
     print(f"Evaluating on: {data_source_dir}")
     model.eval() # Set model to evaluation mode
@@ -212,7 +216,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
     # This ensures all keys are present in the output, even if a component is zero
     all_loss_keys = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 
                      'contrastive', 'contrastive_v', 'contrastive_h', 'contrastive_hv', 
-                     'total', 'compare_lc0']
+                     'contrastive_source', 'total', 'compare_lc0']
     for key in all_loss_keys:
         accumulated_losses[key] = 0.0
 
@@ -222,13 +226,34 @@ def evaluate_model(model: ViTChess, device: torch.device,
             current_batch_size = batch['bitboards'].size(0) # Actual batch size
             total_positions += current_batch_size
 
+            # Ensure all flag tensors are present, defaulting to zeros if missing
+            current_B = batch['bitboards'].size(0)
+            default_flags_kwargs = {}
+            expected_flags = ['is960', 'stm', 'rep1', 'rep2']
+            for flag_key in expected_flags:
+                if batch.get(flag_key) is None:
+                    # print(f"Warning: flag {flag_key} not found in batch. Defaulting to zeros.")
+                    default_flags_kwargs[flag_key] = torch.zeros(current_B, dtype=torch.float, device=device)
+                else:
+                    default_flags_kwargs[flag_key] = batch.get(flag_key)
+            
+            # Handle is_lichess_game separately due to different key name
+            if batch.get('is_lichess_game') is None:
+                # print(f"Warning: flag is_lichess_game not found in batch. Defaulting to zeros.")
+                default_flags_kwargs['is_lichess'] = torch.zeros(current_B, dtype=torch.float, device=device)
+            else:
+                default_flags_kwargs['is_lichess'] = batch.get('is_lichess_game')
+
             outputs = model(
                 batch['bitboards'],
-                is960=batch.get('is960'),
-                stm=batch.get('stm'),
-                rep1=batch.get('rep1'),
-                rep2=batch.get('rep2'),
-                # No flipped boards needed for evaluation unless specifically testing contrastive loss robustness
+                is960=default_flags_kwargs['is960'],
+                stm=default_flags_kwargs['stm'],
+                rep1=default_flags_kwargs['rep1'],
+                rep2=default_flags_kwargs['rep2'],
+                is_lichess=default_flags_kwargs['is_lichess'], 
+                flipped_bitboards_v=batch.get('bitboards_v'),
+                flipped_bitboards_h=batch.get('bitboards_h'),
+                flipped_bitboards_hv=batch.get('bitboards_hv')
             )
             
             logits = outputs['policy']
@@ -253,33 +278,59 @@ def evaluate_model(model: ViTChess, device: torch.device,
             # Here, we are NOT passing flipped_bitboards, so 'early_cls' will be present, but contrastive components might be missing
             # from 'outputs' if the model's forward pass expects flipped inputs to generate them.
             # We will rely on the training loop's contrastive loss calculation logic for the keys.
-            loss_contrast = torch.tensor(0.0, device=device) # Default if no components
-            individual_nt_xent_losses = {'contrastive_v': 0.0, 'contrastive_h': 0.0, 'contrastive_hv': 0.0}
+            # loss_contrast = torch.tensor(0.0, device=device) # Default if no components
+            # Updated contrastive loss calculation for evaluation (similar to training)
+            
+            loss_contrast_flip_v = torch.tensor(0.0, device=device)
+            loss_contrast_flip_h = torch.tensor(0.0, device=device)
+            loss_contrast_flip_hv = torch.tensor(0.0, device=device)
+            loss_contrast_source = torch.tensor(0.0, device=device)
 
-            cls_orig = outputs.get("early_cls")
-            if cls_orig is not None and cls_orig.shape[0] > 0 : # Check if cls_orig exists and is not empty
-                loss_contrast_components_eval = []
+            cls_orig_eval = outputs.get("early_cls")
+            if cls_orig_eval is not None and cls_orig_eval.shape[0] > 0:
                 if 'contrastive_cls_v_flip' in outputs and outputs['contrastive_cls_v_flip'] is not None and \
-                   outputs['contrastive_cls_v_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_v_eval = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_v_flip'], temperature=nt_xent_temperature)
-                    loss_contrast_components_eval.append(loss_v_eval)
-                    individual_nt_xent_losses['contrastive_v'] = loss_v_eval.item()
-
+                   outputs['contrastive_cls_v_flip'].shape[0] == cls_orig_eval.shape[0]:
+                    loss_contrast_flip_v = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_v_flip'], temperature=nt_xent_temperature)
+                
                 if 'contrastive_cls_h_flip' in outputs and outputs['contrastive_cls_h_flip'] is not None and \
-                   outputs['contrastive_cls_h_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_h_eval = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_h_flip'], temperature=nt_xent_temperature)
-                    loss_contrast_components_eval.append(loss_h_eval)
-                    individual_nt_xent_losses['contrastive_h'] = loss_h_eval.item()
+                   outputs['contrastive_cls_h_flip'].shape[0] == cls_orig_eval.shape[0]:
+                    loss_contrast_flip_h = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_h_flip'], temperature=nt_xent_temperature)
 
                 if 'contrastive_cls_hv_flip' in outputs and outputs['contrastive_cls_hv_flip'] is not None and \
-                   outputs['contrastive_cls_hv_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_hv_eval = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_hv_flip'], temperature=nt_xent_temperature)
-                    loss_contrast_components_eval.append(loss_hv_eval)
-                    individual_nt_xent_losses['contrastive_hv'] = loss_hv_eval.item()
-                
-                if loss_contrast_components_eval:
-                    loss_contrast = sum(loss_contrast_components_eval) / len(loss_contrast_components_eval)
+                   outputs['contrastive_cls_hv_flip'].shape[0] == cls_orig_eval.shape[0]:
+                    loss_contrast_flip_hv = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_hv_flip'], temperature=nt_xent_temperature)
+
+                # Source contrastive for evaluation (requires careful handling of batch content)
+                # This part is tricky for evaluation as a single batch might not have both sources.
+                # For simplicity, we'll only compute if a hypothetical cross-source batch was formed.
+                # Or, more realistically, we acknowledge this component might be zero during typical eval.
+                # For now, let's assume it's zero in eval or would need specific eval batches.
+                # We will log its individual component as 0 if not computed.
+
+            # Weighted average of contrastive losses for evaluation
+            # For evaluation, this is more for consistent logging. The actual values depend on whether flipped boards were passed.
+            # If not passed (typical for eval), flip losses will be based on potentially non-existent keys or be zero.
+            # The training part has the actual logic for constructing these.
+            # Here, we just sum up what was computed.
+            # The weighting logic from training (1 for flips, 3 for source) is applied.
+            num_flip_components = 0
+            sum_flip_losses = torch.tensor(0.0, device=device)
+            if loss_contrast_flip_v.item() > 0: sum_flip_losses+=loss_contrast_flip_v; num_flip_components+=1
+            if loss_contrast_flip_h.item() > 0: sum_flip_losses+=loss_contrast_flip_h; num_flip_components+=1
+            if loss_contrast_flip_hv.item() > 0: sum_flip_losses+=loss_contrast_flip_hv; num_flip_components+=1
             
+            avg_flip_loss = sum_flip_losses / num_flip_components if num_flip_components > 0 else torch.tensor(0.0, device=device)
+
+            # In evaluation, loss_contrast_source would typically be 0 unless eval data is specifically set up for it.
+            # The overall contrastive loss is the weighted average.
+            # Weights: flips=1 each, source=3. Total weight = num_flip_components + (3 if source_loss > 0 else 0)
+            total_contrastive_weight = num_flip_components
+            weighted_sum_contrastive = avg_flip_loss * num_flip_components # Sum of flip losses
+            
+            # For evaluation, we assume loss_contrast_source is not actively computed unless eval setup is very specific.
+            # So, effectively, the contrastive loss reported in eval will be the average of available flip losses.
+            loss_contrast = avg_flip_loss # Default to average of flip losses for eval
+
             lw = loss_weights_cfg
             total_loss = (
                 lw['policy'] * loss_policy +
@@ -296,10 +347,12 @@ def evaluate_model(model: ViTChess, device: torch.device,
             accumulated_losses['moves_left'] += loss_moves.item() * current_batch_size
             accumulated_losses['auxiliary_value'] += loss_aux.item() * current_batch_size
             accumulated_losses['material'] += loss_material.item() * current_batch_size
-            accumulated_losses['contrastive'] += loss_contrast.item() * current_batch_size
-            accumulated_losses['contrastive_v'] += individual_nt_xent_losses['contrastive_v'] * current_batch_size
-            accumulated_losses['contrastive_h'] += individual_nt_xent_losses['contrastive_h'] * current_batch_size
-            accumulated_losses['contrastive_hv'] += individual_nt_xent_losses['contrastive_hv'] * current_batch_size
+            accumulated_losses['contrastive'] += loss_contrast.item() * current_batch_size # This is the overall weighted average
+            accumulated_losses['contrastive_v'] += loss_contrast_flip_v.item() * current_batch_size
+            accumulated_losses['contrastive_h'] += loss_contrast_flip_h.item() * current_batch_size
+            accumulated_losses['contrastive_hv'] += loss_contrast_flip_hv.item() * current_batch_size
+            # Add source contrastive loss to accumulated_losses (will be 0 if not computed)
+            accumulated_losses['contrastive_source'] = accumulated_losses.get('contrastive_source', 0.0) + loss_contrast_source.item() * current_batch_size
             accumulated_losses['total'] += total_loss.item() * current_batch_size
             accumulated_losses['compare_lc0'] += compare_lc0.item() * current_batch_size
             
@@ -346,7 +399,12 @@ def main(config_path: str):
     model_cfg_types['early_depth'] = int(model_cfg_types['early_depth'])
     model_cfg_types['heads'] = int(model_cfg_types['heads'])
     model_cfg_types['freeze_distance_iters'] = int(model_cfg_types['freeze_distance_iters'])
-    model_cfg_types['pool_every_k_blocks'] = int(model_cfg_types.get('pool_every_k_blocks', 0))
+    # Handle Optional[int] for pool_every_k_blocks
+    pool_every_k_config_val = model_cfg_types.get('pool_every_k_blocks')
+    if pool_every_k_config_val is not None:
+        model_cfg_types['pool_every_k_blocks'] = int(pool_every_k_config_val)
+    else:
+        model_cfg_types['pool_every_k_blocks'] = None # Ensure it's None if not present or explicitly None
     model_cfg_types['cls_dropout_rate'] = float(model_cfg_types.get('cls_dropout_rate', 0.0))
     model_cfg_types['cls_pool_alpha_init'] = float(model_cfg_types.get('cls_pool_alpha_init', 1.0))
     model_cfg_types['cls_pool_alpha_requires_grad'] = bool(model_cfg_types.get('cls_pool_alpha_requires_grad', True))
@@ -374,7 +432,9 @@ def main(config_path: str):
 
     # Load distance matrix
     dist_path = cfg['model']['distance_matrix_path']
-    distance_matrix = torch.from_numpy(np.load(dist_path)).float().to(device)
+    # distance_matrix is (65,65). MultiHeadSelfAttention in Block will expand it per head.
+    distance_matrix_numpy = np.load(dist_path)
+    distance_matrix = torch.from_numpy(distance_matrix_numpy).float() # Keep on CPU, model init moves to device
 
     # Build model
     model_cfg = dict(
@@ -384,7 +444,7 @@ def main(config_path: str):
         heads=cfg['model']['heads'],
         distance_matrix=distance_matrix,
         freeze_distance=True,
-        pool_every_k_blocks=cfg['model'].get('pool_every_k_blocks') if cfg['model'].get('pool_every_k_blocks', 0) > 0 else None,
+        pool_every_k_blocks=cfg['model']['pool_every_k_blocks'],
         cls_dropout_rate=cfg['model']['cls_dropout_rate'],
         cls_pool_alpha_init=cfg['model']['cls_pool_alpha_init'],
         cls_pool_alpha_requires_grad=cfg['model']['cls_pool_alpha_requires_grad'],
@@ -401,11 +461,20 @@ def main(config_path: str):
     model.to(device)
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(
-        model.parameters(),
+    optimizer_args = dict(
         lr=opt_cfg['lr'],
         betas=opt_cfg['betas'],
         weight_decay=opt_cfg['weight_decay']
+    )
+    if device.type == 'cuda': # Only use fused if on CUDA
+        optimizer_args['fused'] = True
+        print("INFO: Using fused AdamW optimizer for CUDA.")
+    else:
+        print("INFO: Using non-fused AdamW optimizer (device is not CUDA).")
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        **optimizer_args
     )
     # Cosine with warmup: placeholder scheduler
     total_steps = rt['max_steps']
@@ -421,7 +490,7 @@ def main(config_path: str):
     # DataLoader
     loader = make_dataset(
         dataset_type=ds_cfg['type'],
-        data_dir=ds_cfg['raw_data_dir'], # This path will be PGNs or Tensors based on type
+        data_dir=ds_cfg['data_dir'], # Changed from raw_data_dir
         batch_size=ds_cfg['batch_size'],
         num_workers=ds_cfg['num_workers'],
         flips=ds_cfg['flips'], # Passed along, used by streaming, ignored by tensor dataset directly
@@ -437,7 +506,9 @@ def main(config_path: str):
 
     # Rolling metrics
     window = rm['window_size']
-    metric_names = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 'contrastive', 'contrastive_v', 'contrastive_h', 'contrastive_hv', 'total', 'compare_lc0']
+    metric_names = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 
+                    'contrastive', 'contrastive_v', 'contrastive_h', 'contrastive_hv', 
+                    'contrastive_source', 'total', 'compare_lc0'] # Added 'contrastive_source'
     metrics = {name: deque(maxlen=window) for name in metric_names}
 
     # History of rolling metrics
@@ -460,6 +531,7 @@ def main(config_path: str):
     log_every = rt['log_every']
     ckpt_every = rt['ckpt_every']
     val_every = rt['val_every']
+    test_data_dir_from_cfg = ds_cfg.get('test_data_dir', 'test') # Changed from rt to ds_cfg
     freeze_iters = model_cfg_types['freeze_distance_iters']
 
     try:
@@ -479,14 +551,33 @@ def main(config_path: str):
             batch = move_batch_to_device(cpu_batch, device) 
             # Data is now on the correct device
 
+            # Ensure all flag tensors are present, defaulting to zeros if missing
+            current_B = batch['bitboards'].size(0)
+            default_flags_kwargs = {}
+            expected_flags = ['is960', 'stm', 'rep1', 'rep2']
+            for flag_key in expected_flags:
+                if batch.get(flag_key) is None:
+                    # print(f"Warning: flag {flag_key} not found in batch. Defaulting to zeros.")
+                    default_flags_kwargs[flag_key] = torch.zeros(current_B, dtype=torch.float, device=device)
+                else:
+                    default_flags_kwargs[flag_key] = batch.get(flag_key)
+            
+            # Handle is_lichess_game separately due to different key name
+            if batch.get('is_lichess_game') is None:
+                # print(f"Warning: flag is_lichess_game not found in batch. Defaulting to zeros.")
+                default_flags_kwargs['is_lichess'] = torch.zeros(current_B, dtype=torch.float, device=device)
+            else:
+                default_flags_kwargs['is_lichess'] = batch.get('is_lichess_game')
+
             # Forward + loss
             with autocast():
                 outputs = model(
                     batch['bitboards'],
-                    is960=batch.get('is960'),
-                    stm=batch.get('stm'),
-                    rep1=batch.get('rep1'),
-                    rep2=batch.get('rep2'),
+                    is960=default_flags_kwargs['is960'],
+                    stm=default_flags_kwargs['stm'],
+                    rep1=default_flags_kwargs['rep1'],
+                    rep2=default_flags_kwargs['rep2'],
+                    is_lichess=default_flags_kwargs['is_lichess'], 
                     flipped_bitboards_v=batch.get('bitboards_v'),
                     flipped_bitboards_h=batch.get('bitboards_h'),
                     flipped_bitboards_hv=batch.get('bitboards_hv')
@@ -521,25 +612,74 @@ def main(config_path: str):
                 loss_contrast_components = []
                 individual_nt_xent_losses = {}
                 nt_temperature = cfg.get('loss_weights', {}).get('nt_xent_temperature', 0.1)
+                
+                loss_contrast_flip_v = torch.tensor(0.0, device=device)
+                loss_contrast_flip_h = torch.tensor(0.0, device=device)
+                loss_contrast_flip_hv = torch.tensor(0.0, device=device)
+                loss_contrast_source = torch.tensor(0.0, device=device)
+
                 if 'contrastive_cls_v_flip' in outputs and outputs['contrastive_cls_v_flip'] is not None and \
                    cls_orig.shape[0] > 0 and outputs['contrastive_cls_v_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_v = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_v_flip'], temperature=nt_temperature)
-                    loss_contrast_components.append(loss_v)
-                    individual_nt_xent_losses['contrastive_v'] = loss_v.item() # This is already handled when metrics are recorded
+                    loss_contrast_flip_v = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_v_flip'], temperature=nt_temperature)
+                    individual_nt_xent_losses['contrastive_v'] = loss_contrast_flip_v.item()
+                
                 if 'contrastive_cls_h_flip' in outputs and outputs['contrastive_cls_h_flip'] is not None and \
                    cls_orig.shape[0] > 0 and outputs['contrastive_cls_h_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_h = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_h_flip'], temperature=nt_temperature)
-                    loss_contrast_components.append(loss_h)
-                    individual_nt_xent_losses['contrastive_h'] = loss_h.item()
+                    loss_contrast_flip_h = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_h_flip'], temperature=nt_temperature)
+                    individual_nt_xent_losses['contrastive_h'] = loss_contrast_flip_h.item()
+
                 if 'contrastive_cls_hv_flip' in outputs and outputs['contrastive_cls_hv_flip'] is not None and \
                    cls_orig.shape[0] > 0 and outputs['contrastive_cls_hv_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_hv = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_hv_flip'], temperature=nt_temperature)
-                    loss_contrast_components.append(loss_hv)
-                    individual_nt_xent_losses['contrastive_hv'] = loss_hv.item()
+                    loss_contrast_flip_hv = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_hv_flip'], temperature=nt_temperature)
+                    individual_nt_xent_losses['contrastive_hv'] = loss_contrast_flip_hv.item()
 
-                loss_contrast = torch.tensor(0.0, device=device) # Default
-                if loss_contrast_components:
-                    loss_contrast = sum(loss_contrast_components) / len(loss_contrast_components)
+                # Cross-source NT-Xent loss
+                is_lichess_flags = batch.get('is_lichess_game')
+                if is_lichess_flags is not None and cls_orig.shape[0] > 0:
+                    lichess_indices = torch.where(is_lichess_flags == 1)[0]
+                    lc0_indices = torch.where(is_lichess_flags == 0)[0]
+
+                    if len(lichess_indices) > 0 and len(lc0_indices) > 0:
+                        # Sample min_len from both to create pairs
+                        min_len = min(len(lichess_indices), len(lc0_indices))
+                        
+                        # Randomly sample `min_len` indices from both Lichess and Lc0 embeddings
+                        # Ensure sampling is done on the device of the indices tensor
+                        perm_lichess = torch.randperm(len(lichess_indices), device=lichess_indices.device)[:min_len]
+                        perm_lc0 = torch.randperm(len(lc0_indices), device=lc0_indices.device)[:min_len]
+                        
+                        sampled_lichess_indices = lichess_indices[perm_lichess]
+                        sampled_lc0_indices = lc0_indices[perm_lc0]
+                        
+                        cls_lichess = cls_orig[sampled_lichess_indices]
+                        cls_lc0 = cls_orig[sampled_lc0_indices]
+                        
+                        loss_contrast_source = nt_xent_loss_fn(cls_lichess, cls_lc0, temperature=nt_temperature)
+                        individual_nt_xent_losses['contrastive_source'] = loss_contrast_source.item()
+                    else:
+                        individual_nt_xent_losses['contrastive_source'] = 0.0 # Ensure key exists if no pairs
+                else:
+                    individual_nt_xent_losses['contrastive_source'] = 0.0 # Ensure key exists if flags missing
+
+                # Calculate weighted average for the 'contrastive' loss component
+                # Weights: 1 for each flip (v,h,hv), 3 for source
+                weighted_sum_contrast_losses = torch.tensor(0.0, device=device)
+                total_weight_contrast = 0.0
+                
+                if loss_contrast_flip_v.item() > 1e-9: # Check if loss is non-trivial
+                    weighted_sum_contrast_losses += 1.0 * loss_contrast_flip_v
+                    total_weight_contrast += 1.0
+                if loss_contrast_flip_h.item() > 1e-9:
+                    weighted_sum_contrast_losses += 1.0 * loss_contrast_flip_h
+                    total_weight_contrast += 1.0
+                if loss_contrast_flip_hv.item() > 1e-9:
+                    weighted_sum_contrast_losses += 1.0 * loss_contrast_flip_hv
+                    total_weight_contrast += 1.0
+                if loss_contrast_source.item() > 1e-9:
+                    weighted_sum_contrast_losses += 3.0 * loss_contrast_source
+                    total_weight_contrast += 3.0
+                
+                final_averaged_contrast_loss = weighted_sum_contrast_losses / total_weight_contrast if total_weight_contrast > 0 else torch.tensor(0.0, device=device)
                 # --- End Original Loss Calculation ---
 
                 # Weighted total (using direct batch-averaged losses)
@@ -550,7 +690,7 @@ def main(config_path: str):
                     + lw['moves_left'] * loss_moves
                     + lw['auxiliary_value'] * loss_aux
                     + lw['material'] * loss_material
-                    + lw['contrastive'] * loss_contrast 
+                    + lw['contrastive'] * final_averaged_contrast_loss 
                 )
                 # Comparison metric (using direct batch-averaged losses)
                 compare_lc0 = (
@@ -576,11 +716,12 @@ def main(config_path: str):
             metrics['moves_left'].append(loss_moves.item())
             metrics['auxiliary_value'].append(loss_aux.item())
             metrics['material'].append(loss_material.item())
-            metrics['contrastive'].append(loss_contrast.item() if isinstance(loss_contrast, torch.Tensor) else loss_contrast)
+            metrics['contrastive'].append(final_averaged_contrast_loss.item())
             # The individual_nt_xent_losses part for metrics was already correct and remains
             metrics.setdefault('contrastive_v', deque(maxlen=window)).append(individual_nt_xent_losses.get('contrastive_v', 0.0))
             metrics.setdefault('contrastive_h', deque(maxlen=window)).append(individual_nt_xent_losses.get('contrastive_h', 0.0))
             metrics.setdefault('contrastive_hv', deque(maxlen=window)).append(individual_nt_xent_losses.get('contrastive_hv', 0.0))
+            metrics.setdefault('contrastive_source', deque(maxlen=window)).append(individual_nt_xent_losses.get('contrastive_source', 0.0))
             metrics['total'].append(total_loss.item())
             metrics['compare_lc0'].append(compare_lc0.item())
 
@@ -614,7 +755,7 @@ def main(config_path: str):
                 elapsed = current_time - last_log_time
                 throughput = positions / elapsed if elapsed > 0 else float('inf')
                 # Print rolling total loss and throughput
-                print(f"[Step {step+1}/{rt['max_steps']}] total_loss: {mean_metrics['total']:.4f}, lc0_loss: {mean_metrics['compare_lc0']:.4f}, policy: {mean_metrics['policy']:.4f}, value: {mean_metrics['value']:.4f}, moves_left: {mean_metrics['moves_left']:.4f}, auxiliary_value: {mean_metrics['auxiliary_value']:.4f}, material: {mean_metrics['material']:.4f}, contrastive_avg: {mean_metrics.get('contrastive', 0.0):.4f} (v:{mean_metrics.get('contrastive_v',0.0):.2f}, h:{mean_metrics.get('contrastive_h',0.0):.2f}, hv:{mean_metrics.get('contrastive_hv',0.0):.2f}), {throughput:.1f} positions/sec, data_load_time: {mean_data_loading_time:.4f}s{alpha_log_str}")
+                print(f"[Step {step+1}/{rt['max_steps']}] total_loss: {mean_metrics['total']:.4f}, lc0_loss: {mean_metrics['compare_lc0']:.4f}, policy: {mean_metrics['policy']:.4f}, value: {mean_metrics['value']:.4f}, moves_left: {mean_metrics['moves_left']:.4f}, auxiliary_value: {mean_metrics['auxiliary_value']:.4f}, material: {mean_metrics['material']:.4f}, contrastive_avg: {mean_metrics.get('contrastive', 0.0):.4f} (v:{mean_metrics.get('contrastive_v',0.0):.2f}, h:{mean_metrics.get('contrastive_h',0.0):.2f}, hv:{mean_metrics.get('contrastive_hv',0.0):.2f}, src:{mean_metrics.get('contrastive_source',0.0):.2f}), {throughput:.1f} positions/sec, data_load_time: {mean_data_loading_time:.4f}s{alpha_log_str}", flush=True)
                 last_log_time = current_time
                 last_log_step = step + 1
 
@@ -624,29 +765,31 @@ def main(config_path: str):
                 original_model_training_state = model.training
                 model.eval() # Set to eval mode
 
-                test_base_dir = rt['test_data_dir']
+                test_base_dir = test_data_dir_from_cfg # Use variable derived from ds_cfg
                 if not os.path.isdir(test_base_dir):
                     print(f"Warning: Test data directory {test_base_dir} not found. Skipping validation.")
                 else:
                     val_steps_history.append(step + 1) # Record this validation step
-                    for source_name in os.listdir(test_base_dir):
-                        source_path = os.path.join(test_base_dir, source_name)
-                        avg_val_losses = evaluate_model(
-                            model, device, source_path,
-                            ds_cfg['batch_size'], ds_cfg['num_workers'],
-                            ds_cfg['tensor_glob_pattern'], cfg['loss_weights'],
-                            cfg.get('loss_weights', {}).get('nt_xent_temperature', 0.1),
-                            seed=cfg.get('seed', 42)
-                        )
-                        print(f"Validation Results for {source_name.upper()} (Step {step+1}):")
-                        log_val_message_parts = []
-                        for loss_n, loss_v in avg_val_losses.items():
-                            loss_history[loss_n][f'val_{source_name}'] = loss_history[loss_n].get(f'val_{source_name}', []) + [loss_v]
-                            if writer:
-                                writer.add_scalar(f'val/{source_name}/{loss_n}', loss_v, step + 1)
-                            if loss_n in ['total', 'policy', 'value', 'compare_lc0']: # Print key validation losses
-                                log_val_message_parts.append(f"{loss_n}: {loss_v:.4f}")
-                        print("  " + ", ".join(log_val_message_parts))
+                    for source_name_in_dir in os.listdir(test_base_dir):
+                        source_path_to_check = os.path.join(test_base_dir, source_name_in_dir)
+                        if os.path.isdir(source_path_to_check): # Only process if it's a directory
+                            avg_val_losses = evaluate_model(
+                                model, device, source_path_to_check, # Pass the actual directory
+                                ds_cfg['batch_size'], ds_cfg['num_workers'],
+                                ds_cfg['tensor_glob_pattern'], cfg['loss_weights'],
+                                cfg.get('loss_weights', {}).get('nt_xent_temperature', 0.1),
+                                seed=cfg.get('seed', 42),
+                                is_lichess_key='is_lichess_game'
+                            )
+                            print(f"Validation Results for {source_name_in_dir.upper()} (Step {step+1}):")
+                            log_val_message_parts = []
+                            for loss_n, loss_v in avg_val_losses.items():
+                                loss_history[loss_n][f'val_{source_name_in_dir}'] = loss_history[loss_n].get(f'val_{source_name_in_dir}', []) + [loss_v]
+                                if writer:
+                                    writer.add_scalar(f'val/{source_name_in_dir}/{loss_n}', loss_v, step + 1)
+                                if loss_n in ['total', 'policy', 'value', 'compare_lc0']: # Print key validation losses
+                                    log_val_message_parts.append(f"{loss_n}: {loss_v:.4f}")
+                            print("  " + ", ".join(log_val_message_parts))
                 
                 if original_model_training_state:
                     model.train() # Restore training mode

@@ -286,20 +286,23 @@ def evaluate_model(model: ViTChess, device: torch.device,
             loss_contrast_flip_hv = torch.tensor(0.0, device=device)
             loss_contrast_source = torch.tensor(0.0, device=device)
 
+            individual_nt_xent_losses = {}
+
             cls_orig_eval = outputs.get("early_cls")
             if cls_orig_eval is not None and cls_orig_eval.shape[0] > 0:
                 if 'contrastive_cls_v_flip' in outputs and outputs['contrastive_cls_v_flip'] is not None and \
                    outputs['contrastive_cls_v_flip'].shape[0] == cls_orig_eval.shape[0]:
                     loss_contrast_flip_v = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_v_flip'], temperature=nt_xent_temperature)
+                    individual_nt_xent_losses['contrastive_v'] = loss_contrast_flip_v.item()
                 
                 if 'contrastive_cls_h_flip' in outputs and outputs['contrastive_cls_h_flip'] is not None and \
                    outputs['contrastive_cls_h_flip'].shape[0] == cls_orig_eval.shape[0]:
                     loss_contrast_flip_h = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_h_flip'], temperature=nt_xent_temperature)
-
+                    individual_nt_xent_losses['contrastive_h'] = loss_contrast_flip_h.item()
                 if 'contrastive_cls_hv_flip' in outputs and outputs['contrastive_cls_hv_flip'] is not None and \
                    outputs['contrastive_cls_hv_flip'].shape[0] == cls_orig_eval.shape[0]:
                     loss_contrast_flip_hv = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_hv_flip'], temperature=nt_xent_temperature)
-
+                    individual_nt_xent_losses['contrastive_hv'] = loss_contrast_flip_hv.item()
                 # Cross-source NT-Xent loss - Modified for true source flag toggle
                 if cls_orig_eval.shape[0] > 0:
                     # Get original bitboards and flags from the batch, ensure they are on the correct device

@@ -123,7 +123,7 @@ def make_dataset(
         pin_memory=True,
         collate_fn=current_collate_fn,
         persistent_workers=True if dl_num_workers > 0 else False,
-        prefetch_factor=3 if dl_num_workers > 0 else None,
+        prefetch_factor=6 if dl_num_workers > 0 else None,
         multiprocessing_context='spawn' if dl_num_workers > 0 else None
     )
     return loader

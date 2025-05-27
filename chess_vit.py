@@ -82,25 +82,29 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         
-        # Use Flash Attention if available and no bias is needed
-        if USE_FLASH and (self.bias is None or torch.all(self.bias == 0)):
-            # Flash Attention path - much faster
+        # Use Flash Attention if available and leverage it even when bias exists by passing it as an additive attn_mask
+        if USE_FLASH:
+            attn_mask = None
+            if self.bias is not None and not torch.all(self.bias == 0):
+                # Prepare additive bias mask scaled appropriately and broadcast to (B, heads, N, N)
+                # self.bias shape: (heads, 65, 65) → slice to current sequence length N
+                bias_subset = (self.bias[:, :N, :N] * self.bias_scale).to(dtype=q.dtype, device=q.device)  # (heads, N, N)
+                # Expand across the batch dimension for broadcasting
+                attn_mask = bias_subset.unsqueeze(0).expand(B, -1, -1, -1)  # (B, heads, N, N)
+            # Flash-/memory-efficient attention path
             x = scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=None,
+                q, k, v,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
                 scale=self.scale
             )
             x = x.transpose(1, 2).reshape(B, N, C)
         else:
-            # Original implementation for cases with bias
+            # Fallback implementation (manual attention computation) for older PyTorch / unsupported devices
             attn = (q @ k.transpose(-2, -1)) * self.scale
-            
-            # Apply per-head bias if it exists
             if self.bias is not None:
                 head_biases = self.bias[:, :N, :N].unsqueeze(0)
                 attn = attn + self.bias_scale * head_biases
-            
             attn = attn.softmax(dim=-1)
             x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         

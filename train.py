@@ -18,7 +18,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque, defaultdict
 from safetensors.torch import save_file
-from losses import ply_loss_fn, custom_policy_loss_fn, nt_xent_loss_fn, new_policy_loss_fn
+from losses import (
+    ply_loss_fn as _ply_loss_fn,
+    custom_policy_loss_fn as _custom_policy_loss_fn,
+    nt_xent_loss_fn as _nt_xent_loss_fn,
+    new_policy_loss_fn as _new_policy_loss_fn,
+)
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -267,9 +272,9 @@ def evaluate_model(model: ViTChess, device: torch.device,
             else:
                 target_for_loss = policy_target_from_batch.to(device=logits.device)
             
-            loss_policy = new_policy_loss_fn(target_for_loss, logits)
+            loss_policy = _new_policy_loss_fn(target_for_loss, logits)
             loss_value = F.cross_entropy(outputs['final_value'], batch['value_target'])
-            loss_moves = ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
+            loss_moves = _ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
             loss_aux = F.cross_entropy(outputs['early_value'], batch['value_target'])
             loss_material = F.cross_entropy(outputs['early_material'], batch['material_category'])
 
@@ -292,16 +297,16 @@ def evaluate_model(model: ViTChess, device: torch.device,
             if cls_orig_eval is not None and cls_orig_eval.shape[0] > 0:
                 if 'contrastive_cls_v_flip' in outputs and outputs['contrastive_cls_v_flip'] is not None and \
                    outputs['contrastive_cls_v_flip'].shape[0] == cls_orig_eval.shape[0]:
-                    loss_contrast_flip_v = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_v_flip'], temperature=nt_xent_temperature)
+                    loss_contrast_flip_v = _nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_v_flip'], temperature=nt_xent_temperature)
                     individual_nt_xent_losses['contrastive_v'] = loss_contrast_flip_v.item()
                 
                 if 'contrastive_cls_h_flip' in outputs and outputs['contrastive_cls_h_flip'] is not None and \
                    outputs['contrastive_cls_h_flip'].shape[0] == cls_orig_eval.shape[0]:
-                    loss_contrast_flip_h = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_h_flip'], temperature=nt_xent_temperature)
+                    loss_contrast_flip_h = _nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_h_flip'], temperature=nt_xent_temperature)
                     individual_nt_xent_losses['contrastive_h'] = loss_contrast_flip_h.item()
                 if 'contrastive_cls_hv_flip' in outputs and outputs['contrastive_cls_hv_flip'] is not None and \
                    outputs['contrastive_cls_hv_flip'].shape[0] == cls_orig_eval.shape[0]:
-                    loss_contrast_flip_hv = nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_hv_flip'], temperature=nt_xent_temperature)
+                    loss_contrast_flip_hv = _nt_xent_loss_fn(cls_orig_eval, outputs['contrastive_cls_hv_flip'], temperature=nt_xent_temperature)
                     individual_nt_xent_losses['contrastive_hv'] = loss_contrast_flip_hv.item()
                 # Cross-source NT-Xent loss - Modified for true source flag toggle
                 if cls_orig_eval.shape[0] > 0:
@@ -332,7 +337,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
                     )
 
                     if cls_toggled.shape[0] == cls_orig_eval.shape[0]:
-                        loss_contrast_source = nt_xent_loss_fn(cls_orig_eval, cls_toggled, temperature=nt_xent_temperature)
+                        loss_contrast_source = _nt_xent_loss_fn(cls_orig_eval, cls_toggled, temperature=nt_xent_temperature)
                         individual_nt_xent_losses['contrastive_source'] = loss_contrast_source.item()
                     else:
                         # This case should ideally not happen if batch sizes are consistent
@@ -355,7 +360,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
             
             avg_flip_loss = sum_flip_losses / num_flip_components if num_flip_components > 0 else torch.tensor(0.0, device=device)
 
-            # In evaluation, loss_contrast_source would typically be 0 unless eval data is specifically set up for it.
+            # In evaluation, loss_contrast_source would typically be zero unless eval data is specifically set up for it.
             # The overall contrastive loss is the weighted average.
             # Weights: flips=1 each, source=3. Total weight = num_flip_components + (3 if source_loss > 0 else 0)
             total_contrastive_weight = num_flip_components
@@ -454,6 +459,10 @@ def main(config_path: str):
     if cfg['runtime']['device'] == 'cuda' and torch.cuda.is_available():
         device = torch.device("cuda")
         print("INFO: Training on CUDA.")
+        # Enable fast-math (TF32) for matmul/conv kernels – big speed win on Ampere+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     else:
         device = torch.device("cpu")
         if cfg['runtime']['device'] == 'cuda':
@@ -568,6 +577,28 @@ def main(config_path: str):
     test_data_dir_from_cfg = ds_cfg.get('test_data_dir', 'test') # Changed from rt to ds_cfg
     freeze_iters = model_cfg_types['freeze_distance_iters']
 
+    # -------------------------------------------------------------
+    # Asynchronous GPU prefetch (overlap H→D transfer with compute)
+    # -------------------------------------------------------------
+    if device.type == "cuda":
+        prefetch_stream = torch.cuda.Stream(device=device)
+    else:
+        prefetch_stream = None
+
+    def _to_gpu_async(cpu_batch):
+        """Move *cpu_batch* to device, optionally on the prefetch stream."""
+        if prefetch_stream is not None:
+            with torch.cuda.stream(prefetch_stream):
+                return move_batch_to_device(cpu_batch, device)
+        # CPU training or no CUDA – synchronous path
+        return move_batch_to_device(cpu_batch, device)
+
+    # Prime the pipeline: fetch first batch
+    first_cpu_batch = next(data_iter)
+    next_gpu_batch = _to_gpu_async(first_cpu_batch)
+    if prefetch_stream is not None:
+        prefetch_stream.synchronize()  # ensure first batch is ready
+
     try:
         while step < rt['max_steps']:
             model.train() # Ensure model is in training mode for the training step
@@ -576,15 +607,23 @@ def main(config_path: str):
             if step % grad_accum == 0:
                 optimizer.zero_grad(set_to_none=True)
 
-            t_data_start = time.time() # Start timing
-            cpu_batch = next(data_iter)
-            t_data_end = time.time() # End timing
-            data_loading_times.append(t_data_end - t_data_start) # Store duration
-            
-            # Move batch to target device and add flipped variants
-            batch = move_batch_to_device(cpu_batch, device) 
-            # Data is now on the correct device
+            # -----------------------------------------------
+            # Get *current* prefetched batch & prefetch next
+            # -----------------------------------------------
+            if prefetch_stream is not None:
+                # Wait for the copy of the current batch to finish
+                torch.cuda.current_stream().wait_stream(prefetch_stream)
 
+            batch = next_gpu_batch  # ready to compute
+
+            # Start prefetch for the subsequent iteration
+            t_data_start = time.time()
+            cpu_batch_next = next(data_iter)
+            t_data_end = time.time()
+            data_loading_times.append(t_data_end - t_data_start)
+
+            next_gpu_batch = _to_gpu_async(cpu_batch_next)
+            
             # Ensure all flag tensors are present, defaulting to zeros if missing
             current_B = batch['bitboards'].size(0)
             default_flags_kwargs = {}
@@ -635,9 +674,9 @@ def main(config_path: str):
                     target_for_loss = policy_target_from_batch.to(device=logits.device) 
                 
                 # --- Original Loss Calculation (Batch Averaged) ---
-                loss_policy = new_policy_loss_fn(target_for_loss, logits) 
+                loss_policy = _new_policy_loss_fn(target_for_loss, logits) 
                 loss_value = F.cross_entropy(outputs['final_value'], batch['value_target'])
-                loss_moves = ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
+                loss_moves = _ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
                 loss_aux = F.cross_entropy(outputs['early_value'], batch['value_target'])
                 loss_material = F.cross_entropy(outputs['early_material'], batch['material_category'])
                 
@@ -654,17 +693,17 @@ def main(config_path: str):
 
                 if 'contrastive_cls_v_flip' in outputs and outputs['contrastive_cls_v_flip'] is not None and \
                    cls_orig.shape[0] > 0 and outputs['contrastive_cls_v_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_contrast_flip_v = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_v_flip'], temperature=nt_temperature)
+                    loss_contrast_flip_v = _nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_v_flip'], temperature=nt_temperature)
                     individual_nt_xent_losses['contrastive_v'] = loss_contrast_flip_v.item()
                 
                 if 'contrastive_cls_h_flip' in outputs and outputs['contrastive_cls_h_flip'] is not None and \
                    cls_orig.shape[0] > 0 and outputs['contrastive_cls_h_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_contrast_flip_h = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_h_flip'], temperature=nt_temperature)
+                    loss_contrast_flip_h = _nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_h_flip'], temperature=nt_temperature)
                     individual_nt_xent_losses['contrastive_h'] = loss_contrast_flip_h.item()
 
                 if 'contrastive_cls_hv_flip' in outputs and outputs['contrastive_cls_hv_flip'] is not None and \
                    cls_orig.shape[0] > 0 and outputs['contrastive_cls_hv_flip'].shape[0] == cls_orig.shape[0]:
-                    loss_contrast_flip_hv = nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_hv_flip'], temperature=nt_temperature)
+                    loss_contrast_flip_hv = _nt_xent_loss_fn(cls_orig, outputs['contrastive_cls_hv_flip'], temperature=nt_temperature)
                     individual_nt_xent_losses['contrastive_hv'] = loss_contrast_flip_hv.item()
 
                 # Cross-source NT-Xent loss - Modified for true source flag toggle
@@ -696,7 +735,7 @@ def main(config_path: str):
                     )
 
                     if cls_toggled.shape[0] == cls_orig.shape[0]:
-                        loss_contrast_source = nt_xent_loss_fn(cls_orig, cls_toggled, temperature=nt_temperature)
+                        loss_contrast_source = _nt_xent_loss_fn(cls_orig, cls_toggled, temperature=nt_temperature)
                         individual_nt_xent_losses['contrastive_source'] = loss_contrast_source.item()
                     else:
                         # This case should ideally not happen if batch sizes are consistent

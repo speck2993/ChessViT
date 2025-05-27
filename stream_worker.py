@@ -84,7 +84,8 @@ def _encode_bitboards(board: chess.Board, rep_count: int) -> np.ndarray:
     Returns:
         np.ndarray: The bitboard tensor of shape (14, 8, 8).
     """
-    bitboards = np.zeros((NUM_BITBOARD_PLANES, 8, 8), dtype=np.float32)
+    # Allocate directly in fp16 so that workers never store fp32 if we only need 0/1 values
+    bitboards = np.zeros((NUM_BITBOARD_PLANES, 8, 8), dtype=np.float16)
 
     for piece_type_val in chess.PIECE_TYPES: 
         plane_offset_white = piece_type_val - 1
@@ -116,7 +117,7 @@ def _encode_policy_target(board: chess.Board, move: chess.Move) -> np.ndarray:
     Returns:
         np.ndarray: The policy tensor.
     """
-    policy = np.zeros((NUM_POLICY_PLANES, 8, 8), dtype=np.float32)
+    policy = np.zeros((NUM_POLICY_PLANES, 8, 8), dtype=np.float16)
     piece_at_from = board.piece_at(move.from_square)
     piece_type_at_from_sq = piece_at_from.piece_type if piece_at_from else None
 

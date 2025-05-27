@@ -338,6 +338,14 @@ def fast_chess_collate_fn(sample_list):
         elif key == "ply_target":
             t = t.short()
         # else keep original (int8 flags)
+        # Ensure tensors are allocated in pinned (page-locked) memory so that the
+        # subsequent H→D copy (triggered by DataLoader with ``pin_memory=True``)
+        # becomes purely asynchronous and does **not** allocate a second buffer.
+        # If the tensor is already pinned this is a no-op; otherwise `.pin_memory()`
+        # returns a pinned clone.
+        if not t.is_pinned():
+            t = t.pin_memory()
+
         out[key] = t
 
     # Explicitly delete the dictionary holding NumPy array views after conversion to tensors.
@@ -360,7 +368,11 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device, *
     # Move all tensors to device first
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
-            out[k] = v.to(device, non_blocking=non_blocking)
+            target_dtype = None
+            # Down-cast certain large float tensors (primarily bitboards) to fp16 when on CUDA to save memory/bandwidth
+            if device.type == "cuda" and v.dtype in {torch.float32, torch.float64} and k == "bitboards":
+                target_dtype = torch.float16
+            out[k] = v.to(device, dtype=target_dtype, non_blocking=non_blocking) if target_dtype is not None else v.to(device, non_blocking=non_blocking)
         else:  # FEN strings, source_file_basename etc.
             out[k] = v
     

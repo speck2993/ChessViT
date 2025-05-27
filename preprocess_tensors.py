@@ -199,8 +199,9 @@ def _flush_chunk_from_buffer(src: str, chunk_size: int, buf: dict[str, list], ou
 
 def _sample_to_lists(sample: dict, lists: dict[str, list]):
     """Convert one stream_worker sample to flat lists (no flips)."""
-    lists["bitboards"         ].append(sample["bitboards_original"].astype(np.float16))
-    lists["policy_target"     ].append(sample["policy"           ].astype(np.float16))
+    # Arrays are already fp16 from stream_worker; astype with copy=False avoids extra copy
+    lists["bitboards"         ].append(sample["bitboards_original"].astype(np.float16, copy=False))
+    lists["policy_target"     ].append(sample["policy"           ].astype(np.float16, copy=False))
     lists["legal_mask"        ].append(sample["legal_mask"       ].astype(np.bool_))
     lists["material_raw"      ].append(np.int8(sample["material_raw"]))
     lists["material_category" ].append(np.uint8(sample["material_cat"]))

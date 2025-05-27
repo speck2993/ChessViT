@@ -175,6 +175,8 @@ class ViTChess(nn.Module):
         # New parameters for the enhanced policy head
         policy_head_conv_dim: int = 128,       # Number of channels for intermediate policy conv layers
         policy_head_mlp_hidden_dim: int = 256, # Hidden dim for the CLS bias MLP in policy head
+        # New parameter for value head MLP
+        value_head_mlp_hidden_dim: Optional[int] = None,
         # Added for consistency, though not strictly needed for ViTChess itself if defaults match
         dim_head: Optional[int] = None, # Will be dim // heads if None
     ):
@@ -225,13 +227,24 @@ class ViTChess(nn.Module):
                     nn.Parameter(torch.tensor(cls_pool_alpha_init), requires_grad=cls_pool_alpha_requires_grad)
                 )
 
-        # --- Early Prediction Heads (from CLS token after early_blocks) ----
-        self.early_value_head = nn.Linear(dim, num_value_outputs)
-        self.early_material_head = nn.Linear(dim, num_material_categories)
+        # --- Prediction Heads ---
+        # Helper to create value heads (single Linear or MLP)
+        def create_value_head(input_dim: int, hidden_dim: Optional[int], output_dim: int) -> nn.Module:
+            if hidden_dim and hidden_dim > 0:
+                return nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, output_dim)
+                )
+            else:
+                return nn.Linear(input_dim, output_dim)
 
-        # --- Final Prediction Heads ----------------------------------------
-        # Value and Moves Left from final CLS token
-        self.final_value_head = nn.Linear(dim, num_value_outputs)
+        # Early Prediction Heads (from CLS token after early_blocks)
+        self.early_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs)
+        self.early_material_head = nn.Linear(dim, num_material_categories) # Material head remains a single Linear layer
+
+        # Final Prediction Heads
+        self.final_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs)
         self.final_moves_left_head = nn.Linear(dim, num_moves_left_outputs)
 
         # --- New Policy Head Architecture ---
@@ -560,12 +573,29 @@ class ViTChess(nn.Module):
         if self.patch_embed.bias is not None:
             nn.init.zeros_(self.patch_embed.bias)
 
-        # Initialize new linear heads and conv layers
-        for head in [self.early_value_head, self.early_material_head,
-                     self.final_value_head, self.final_moves_left_head]: # Removed self.cls_projection_for_policy
-            nn.init.xavier_uniform_(head.weight)
-            if head.bias is not None:
-                nn.init.zeros_(head.bias)
+        # Initialize linear heads and conv layers
+        # Heads to initialize (material and moves_left are always Linear)
+        heads_to_initialize = [
+            self.early_material_head, 
+            self.final_moves_left_head
+        ]
+
+        # Add value heads (could be Linear or Sequential)
+        for value_head_module in [self.early_value_head, self.final_value_head]:
+            if isinstance(value_head_module, nn.Linear):
+                heads_to_initialize.append(value_head_module)
+            elif isinstance(value_head_module, nn.Sequential):
+                for layer in value_head_module:
+                    if isinstance(layer, nn.Linear):
+                        heads_to_initialize.append(layer)
+            else:
+                raise TypeError(f"Unexpected type for value head: {type(value_head_module)}")
+
+        for head_or_layer in heads_to_initialize:
+            if isinstance(head_or_layer, nn.Linear): # Ensure we are only initializing Linear layers directly
+                nn.init.xavier_uniform_(head_or_layer.weight)
+                if head_or_layer.bias is not None:
+                    nn.init.zeros_(head_or_layer.bias)
         
         # Initialize new policy head conv layers and MLP
         for layer in [self.policy_conv1, self.policy_conv2, self.policy_conv3]:
@@ -631,6 +661,7 @@ def load_model_from_checkpoint(
         policy_head_conv_dim=cfg['model'].get('policy_head_conv_dim', 128),
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
         dim_head=cfg['model'].get('dim_head'),
+        value_head_mlp_hidden_dim=cfg['model'].get('value_head_mlp_hidden_dim'),
     )
     model.to(device)
 
@@ -665,6 +696,7 @@ if __name__ == "__main__":
         # New policy head params for testing
         policy_head_conv_dim=128,
         policy_head_mlp_hidden_dim=256,
+        value_head_mlp_hidden_dim=128, # Example for testing new value head MLP
     )
     
     B = 2 # Batch size

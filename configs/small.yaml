@@ -11,6 +11,7 @@ model:
   cls_pool_alpha_init: 1.0
   policy_head_conv_dim: 512
   policy_head_mlp_hidden_dim: 512
+  value_head_mlp_hidden_dim: 256
   num_policy_planes: 73
   drop_path: 0.1
 

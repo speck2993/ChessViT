@@ -1,16 +1,17 @@
 model:
   dim:                   512
-  depth:                 10
+  depth:                 12
   early_depth:           3
   heads:                 8
   distance_matrix_path:  dist_init.npy
-  freeze_distance_iters: 50000
+  freeze_distance_iters: 5000
   pool_every_k_blocks: 3
   cls_dropout_rate: 0.05
   cls_pool_alpha_requires_grad: true
   cls_pool_alpha_init: 1.0
   policy_head_conv_dim: 784
   policy_head_mlp_hidden_dim: 784
+  value_head_mlp_hidden_dim: 512
   num_policy_planes: 73
   drop_path: 0.1
 
@@ -32,7 +33,7 @@ optimiser:
 
 dataset:
   data_dir:     data
-  batch_size:       128
+  batch_size:       200
   grad_accum:       1
   num_workers:      8
   flips:            true

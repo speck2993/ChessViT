@@ -78,6 +78,7 @@ def create_dummy_config(filepath: Path, data_dir: Path, dist_init_path: Path, ou
             'policy_head_conv_dim': 32, 'policy_head_mlp_hidden_dim': 32, # This is used by ViTChess policy_mlp_hidden_dim and policy_head_mlp_hidden_dim
             'num_policy_planes': 73, 'num_value_outputs': 3, 'num_material_categories': 20,
             'num_moves_left_outputs': 1, 'policy_cls_projection_dim': 32,
+            'value_head_mlp_hidden_dim': 32, # Added for the new MLP value head
             'drop_path': 0.0, 'dim_head': None,
         },
         'loss_weights': { 

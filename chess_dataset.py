@@ -368,11 +368,10 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device, *
     # Move all tensors to device first
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
-            target_dtype = None
-            # Down-cast certain large float tensors (primarily bitboards) to fp16 when on CUDA to save memory/bandwidth
-            if device.type == "cuda" and v.dtype in {torch.float32, torch.float64} and k == "bitboards":
-                target_dtype = torch.float16
-            out[k] = v.to(device, dtype=target_dtype, non_blocking=non_blocking) if target_dtype is not None else v.to(device, non_blocking=non_blocking)
+            # Removed explicit downcasting for "bitboards".
+            # Tensors are moved to the device with their original dtype.
+            # Autocast in the training script will handle precision for operations.
+            out[k] = v.to(device, non_blocking=non_blocking)
         else:  # FEN strings, source_file_basename etc.
             out[k] = v
     

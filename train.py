@@ -30,6 +30,8 @@ import matplotlib.pyplot as plt
 import time
 import argparse
 from typing import Optional, Dict, List, Any
+import torch.nn as nn
+import logging
 
 from chess_vit import ViTChess, load_model_from_checkpoint
 from chess_dataset import ChunkMmapDataset, fast_chess_collate_fn, move_batch_to_device
@@ -38,6 +40,63 @@ def load_config(path: str) -> dict:
     # Ensure UTF-8 encoding when reading config to avoid locale decoding errors
     with open(path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
+    
+    # --- Type casting for critical config values ---
+    # Model
+    cfg['model']['dim'] = int(cfg['model']['dim'])
+    cfg['model']['depth'] = int(cfg['model']['depth'])
+    cfg['model']['early_depth'] = int(cfg['model']['early_depth'])
+    cfg['model']['heads'] = int(cfg['model']['heads'])
+    if 'freeze_distance_iters' in cfg['model'] and cfg['model']['freeze_distance_iters'] is not None:
+        cfg['model']['freeze_distance_iters'] = int(cfg['model']['freeze_distance_iters'])
+    if 'pool_every_k_blocks' in cfg['model'] and cfg['model']['pool_every_k_blocks'] is not None:
+        cfg['model']['pool_every_k_blocks'] = int(cfg['model']['pool_every_k_blocks'])
+    if 'cls_dropout_rate' in cfg['model'] and cfg['model']['cls_dropout_rate'] is not None:
+        cfg['model']['cls_dropout_rate'] = float(cfg['model']['cls_dropout_rate'])
+    if 'policy_head_conv_dim' in cfg['model'] and cfg['model']['policy_head_conv_dim'] is not None:
+        cfg['model']['policy_head_conv_dim'] = int(cfg['model']['policy_head_conv_dim'])
+    if 'policy_head_mlp_hidden_dim' in cfg['model'] and cfg['model']['policy_head_mlp_hidden_dim'] is not None: # policy_head_mlp_hidden_dim is correct
+        cfg['model']['policy_head_mlp_hidden_dim'] = int(cfg['model']['policy_head_mlp_hidden_dim'])
+    if 'num_policy_planes' in cfg['model'] and cfg['model']['num_policy_planes'] is not None:
+        cfg['model']['num_policy_planes'] = int(cfg['model']['num_policy_planes'])
+    if 'num_value_outputs' in cfg['model'] and cfg['model']['num_value_outputs'] is not None:
+        cfg['model']['num_value_outputs'] = int(cfg['model']['num_value_outputs'])
+    if 'num_material_categories' in cfg['model'] and cfg['model']['num_material_categories'] is not None:
+        cfg['model']['num_material_categories'] = int(cfg['model']['num_material_categories'])
+    if 'num_moves_left_outputs' in cfg['model'] and cfg['model']['num_moves_left_outputs'] is not None:
+        cfg['model']['num_moves_left_outputs'] = int(cfg['model']['num_moves_left_outputs'])
+    if 'policy_cls_projection_dim' in cfg['model'] and cfg['model']['policy_cls_projection_dim'] is not None:
+        cfg['model']['policy_cls_projection_dim'] = int(cfg['model']['policy_cls_projection_dim'])
+    # Note: policy_mlp_hidden_dim (from ViTChess init) might be policy_head_mlp_hidden_dim in config
+    # This is handled by using cfg_model.get('policy_head_mlp_hidden_dim') later.
+
+    # Optimiser
+    cfg['optimiser']['lr'] = float(cfg['optimiser']['lr'])
+    cfg['optimiser']['weight_decay'] = float(cfg['optimiser']['weight_decay'])
+    if 'warmup_steps' in cfg['optimiser'] and cfg['optimiser']['warmup_steps'] is not None:
+        cfg['optimiser']['warmup_steps'] = int(cfg['optimiser']['warmup_steps'])
+
+    # Dataset
+    cfg['dataset']['batch_size'] = int(cfg['dataset']['batch_size'])
+    if 'grad_accum' in cfg['dataset'] and cfg['dataset']['grad_accum'] is not None: # grad_accum is often in runtime too
+        cfg['dataset']['grad_accum'] = int(cfg['dataset']['grad_accum'])
+    cfg['dataset']['num_workers'] = int(cfg['dataset']['num_workers'])
+
+    # Runtime
+    if 'grad_accum' in cfg['runtime'] and cfg['runtime']['grad_accum'] is not None:
+        cfg['runtime']['grad_accum'] = int(cfg['runtime']['grad_accum'])
+    cfg['runtime']['max_steps'] = int(cfg['runtime']['max_steps'])
+    cfg['runtime']['log_every'] = int(cfg['runtime']['log_every'])
+    cfg['runtime']['ckpt_every'] = int(cfg['runtime']['ckpt_every'])
+    if 'val_every' in cfg['runtime'] and cfg['runtime']['val_every'] is not None:
+        cfg['runtime']['val_every'] = int(cfg['runtime']['val_every'])
+    if 'gradient_clip_norm' in cfg['runtime'] and cfg['runtime']['gradient_clip_norm'] is not None:
+        cfg['runtime']['gradient_clip_norm'] = float(cfg['runtime']['gradient_clip_norm'])
+        
+    # Loss weights
+    for k in cfg['loss_weights']:
+        cfg['loss_weights'][k] = float(cfg['loss_weights'][k])
+
     return cfg
 
 def seed_everything(seed: int):
@@ -199,6 +258,11 @@ def evaluate_model(model: ViTChess, device: torch.device,
     """Evaluates the model on a given dataset and returns average losses."""
     print(f"Evaluating on: {data_source_dir}")
     model.eval() # Set model to evaluation mode
+    total_loss = 0.0
+    total_samples = 0
+    # Initialize dictionaries to store summed losses for averaging
+    summed_losses: Dict[str, float] = defaultdict(float)
+    individual_nt_xent_losses: Dict[str, float] = {} # Initialize here
 
     # Create a new DataLoader for the validation data source
     # shuffle_files=False and infinite=False for consistent evaluation
@@ -214,22 +278,11 @@ def evaluate_model(model: ViTChess, device: torch.device,
         infinite=False
     )
 
-    total_positions = 0
-    accumulated_losses = defaultdict(float)
-    
-    # Define all loss names we expect to calculate (consistent with training)
-    # This ensures all keys are present in the output, even if a component is zero
-    all_loss_keys = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 
-                     'contrastive', 'contrastive_v', 'contrastive_h', 'contrastive_hv', 
-                     'contrastive_source', 'total', 'compare_lc0']
-    for key in all_loss_keys:
-        accumulated_losses[key] = 0.0
-
     with torch.no_grad():
         for i, cpu_batch in enumerate(val_loader):
             batch = move_batch_to_device(cpu_batch, device)
             current_batch_size = batch['bitboards'].size(0) # Actual batch size
-            total_positions += current_batch_size
+            total_samples += current_batch_size
 
             # Ensure all flag tensors are present, defaulting to zeros if missing
             current_B = batch['bitboards'].size(0)
@@ -290,8 +343,6 @@ def evaluate_model(model: ViTChess, device: torch.device,
             loss_contrast_flip_h = torch.tensor(0.0, device=device)
             loss_contrast_flip_hv = torch.tensor(0.0, device=device)
             loss_contrast_source = torch.tensor(0.0, device=device)
-
-            individual_nt_xent_losses = {}
 
             cls_orig_eval = outputs.get("early_cls")
             if cls_orig_eval is not None and cls_orig_eval.shape[0] > 0:
@@ -371,7 +422,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
             loss_contrast = avg_flip_loss # Default to average of flip losses for eval
 
             lw = loss_weights_cfg
-            total_loss = (
+            total_loss += (
                 lw['policy'] * loss_policy +
                 lw['value'] * loss_value +
                 lw['moves_left'] * loss_moves +
@@ -381,29 +432,29 @@ def evaluate_model(model: ViTChess, device: torch.device,
             )
             compare_lc0 = loss_policy + 1.6 * loss_value + 0.5 * loss_moves
 
-            accumulated_losses['policy'] += loss_policy.item() * current_batch_size
-            accumulated_losses['value'] += loss_value.item() * current_batch_size
-            accumulated_losses['moves_left'] += loss_moves.item() * current_batch_size
-            accumulated_losses['auxiliary_value'] += loss_aux.item() * current_batch_size
-            accumulated_losses['material'] += loss_material.item() * current_batch_size
-            accumulated_losses['contrastive'] += loss_contrast.item() * current_batch_size # This is the overall weighted average
-            accumulated_losses['contrastive_v'] += loss_contrast_flip_v.item() * current_batch_size
-            accumulated_losses['contrastive_h'] += loss_contrast_flip_h.item() * current_batch_size
-            accumulated_losses['contrastive_hv'] += loss_contrast_flip_hv.item() * current_batch_size
-            # Add source contrastive loss to accumulated_losses (will be 0 if not computed)
-            accumulated_losses['contrastive_source'] = accumulated_losses.get('contrastive_source', 0.0) + loss_contrast_source.item() * current_batch_size
-            accumulated_losses['total'] += total_loss.item() * current_batch_size
-            accumulated_losses['compare_lc0'] += compare_lc0.item() * current_batch_size
+            summed_losses['policy'] += loss_policy.item() * current_batch_size
+            summed_losses['value'] += loss_value.item() * current_batch_size
+            summed_losses['moves_left'] += loss_moves.item() * current_batch_size
+            summed_losses['auxiliary_value'] += loss_aux.item() * current_batch_size
+            summed_losses['material'] += loss_material.item() * current_batch_size
+            summed_losses['contrastive'] += loss_contrast.item() * current_batch_size # This is the overall weighted average
+            summed_losses['contrastive_v'] += loss_contrast_flip_v.item() * current_batch_size
+            summed_losses['contrastive_h'] += loss_contrast_flip_h.item() * current_batch_size
+            summed_losses['contrastive_hv'] += loss_contrast_flip_hv.item() * current_batch_size
+            # Add source contrastive loss to summed_losses (will be 0 if not computed)
+            summed_losses['contrastive_source'] = summed_losses.get('contrastive_source', 0.0) + loss_contrast_source.item() * current_batch_size
+            summed_losses['total'] += total_loss.item() * current_batch_size
+            summed_losses['compare_lc0'] += compare_lc0.item() * current_batch_size
             
             if (i + 1) % 100 == 0 : # Log progress within evaluation
-                 print(f"  Evaluated {total_positions} positions from {data_source_dir}...")
+                 print(f"  Evaluated {total_samples} positions from {data_source_dir}...")
 
 
-    avg_losses = {name: (loss_sum / total_positions if total_positions > 0 else 0)
-                  for name, loss_sum in accumulated_losses.items()}
+    avg_losses = {name: (loss_sum / total_samples if total_samples > 0 else 0)
+                  for name, loss_sum in summed_losses.items()}
     
     # model.train() # Caller should handle restoring model state
-    print(f"Finished evaluation on {data_source_dir}. Total positions: {total_positions}")
+    print(f"Finished evaluation on {data_source_dir}. Total positions: {total_samples}")
     return avg_losses
 
 def main(config_path: str):
@@ -480,55 +531,89 @@ def main(config_path: str):
     distance_matrix = torch.from_numpy(distance_matrix_numpy).float() # Keep on CPU, model init moves to device
 
     # Build model
-    model_cfg = dict(
+    logging.info("Creating model...")
+    model = ViTChess( # type: ignore
         dim=cfg['model']['dim'],
         depth=cfg['model']['depth'],
         early_depth=cfg['model']['early_depth'],
         heads=cfg['model']['heads'],
+        drop_path=cfg['model'].get('drop_path', 0.1), 
         distance_matrix=distance_matrix,
-        freeze_distance=True,
-        pool_every_k_blocks=cfg['model']['pool_every_k_blocks'],
-        cls_dropout_rate=cfg['model']['cls_dropout_rate'],
-        cls_pool_alpha_init=cfg['model']['cls_pool_alpha_init'],
-        cls_pool_alpha_requires_grad=cfg['model']['cls_pool_alpha_requires_grad'],
-        policy_head_conv_dim=cfg['model']['policy_head_conv_dim'],
-        policy_head_mlp_hidden_dim=cfg['model']['policy_head_mlp_hidden_dim'],
+        freeze_distance=True, 
         num_policy_planes=cfg['model'].get('num_policy_planes', 73),
-        drop_path=cfg['model']['drop_path']
+        num_value_outputs=cfg['model'].get('num_value_outputs', 3),
+        num_material_categories=cfg['model'].get('num_material_categories', 20),
+        num_moves_left_outputs=cfg['model'].get('num_moves_left_outputs', 1),
+        policy_cls_projection_dim=cfg['model'].get('policy_cls_projection_dim', 64),
+        policy_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim'), # Corrected: ViTChess expects policy_mlp_hidden_dim, config provides policy_head_mlp_hidden_dim
+        pool_every_k_blocks=cfg['model'].get('pool_every_k_blocks'),
+        cls_pool_alpha_init=cfg['model'].get('cls_pool_alpha_init', 1.0),
+        cls_pool_alpha_requires_grad=cfg['model'].get('cls_pool_alpha_requires_grad', True),
+        cls_dropout_rate=cfg['model'].get('cls_dropout_rate', 0.0),
+        policy_head_conv_dim=cfg['model'].get('policy_head_conv_dim', 128),
+        policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256), 
+        dim_head=cfg['model'].get('dim_head')
     )
-    model = ViTChess(**model_cfg)
-    try:
-        model = torch.compile(model, mode="max-autotune")
-    except Exception as e:
-        print(f"torch.compile skipped ({e})")
-    model.to(device)
 
-    # Optimizer and scheduler
-    optimizer_args = dict(
-        lr=opt_cfg['lr'],
-        betas=opt_cfg['betas'],
-        weight_decay=opt_cfg['weight_decay']
-    )
-    if device.type == 'cuda': # Only use fused if on CUDA
-        optimizer_args['fused'] = True
-        print("INFO: Using fused AdamW optimizer for CUDA.")
+    # if cfg['runtime']['precision'] == 'fp16':
+    #     logging.info("Converting model to half precision (fp16)...")
+    #     model.half()  # Removed: Let autocast handle precision for ops
+        
+    model.to(device) # Move model to device in its original precision (typically float32)
+    logging.info(f"Model placed on device: {device}. Parameter dtypes (sample):")
+
+    # --- Mixed Precision Scaler (if using fp16) ---
+    # Initialize scaler *after* model is on device.
+    # Scaler is enabled if precision is fp16, autocast will handle op casting.
+    use_amp = cfg['runtime']['precision'] == 'fp16'
+    scaler = GradScaler(enabled=use_amp)
+    
+    if use_amp:
+        logging.info("Mixed precision training ENABLED. GradScaler initialized. Model parameters remain float32; autocast handles ops.")
+        # The explicit bias conversion loop is no longer needed as model params stay float32
     else:
-        print("INFO: Using non-fused AdamW optimizer (device is not CUDA).")
+        logging.info("Mixed precision training DISABLED (using fp32).")
+    
+    # Log a sample of parameter dtypes
+    if model.parameters():
+        sample_param = next(model.parameters())
+        logging.info(f"  Sample model parameter dtype: {sample_param.dtype}, device: {sample_param.device}")
+        if hasattr(model, 'patch_embed') and model.patch_embed.bias is not None:
+            logging.info(f"  Patch_embed bias dtype: {model.patch_embed.bias.dtype}, device: {model.patch_embed.bias.device}")
+    else:
+        logging.warning("Model has no parameters to sample dtype from.")
 
+    # Try to compile the model (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and cfg['runtime'].get('compile_model', False): # Check for compile_model in config
+        try:
+            logging.info("Attempting to compile model with torch.compile()...")
+            model = torch.compile(model) # type: ignore
+            logging.info("Model compiled successfully.")
+        except Exception as e:
+            logging.warning(f"torch.compile failed: {e}. Proceeding with uncompiled model.")
+  
+    # Optimizer and scheduler
+    logging.info("Creating optimizer and scheduler...")
     optimizer = optim.AdamW(
         model.parameters(),
-        **optimizer_args
+        lr=opt_cfg['lr'],
+        weight_decay=opt_cfg['weight_decay'],
+        betas=(opt_cfg['betas'][0], opt_cfg['betas'][1])
     )
-    # Cosine with warmup: placeholder scheduler
-    total_steps = rt['max_steps']
+    
+    # LR Scheduler
     warmup_steps = opt_cfg['warmup_steps']
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps - warmup_steps
-    )
+    total_steps = rt['max_steps'] # Should be defined
 
-    # Mixed precision scaler
-    scaler = GradScaler()
+    if opt_cfg['sched'] == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_steps - warmup_steps) # Ensure T_max is at least 1
+        )
+    elif opt_cfg['sched'] == 'constant':
+        scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=max(1, total_steps))
+    else:
+        raise ValueError(f"Unknown scheduler: {opt_cfg['sched']}")
 
     # DataLoader
     loader = make_dataset(
@@ -684,7 +769,7 @@ def main(config_path: str):
                 cls_orig = outputs["early_cls"]
                 loss_contrast_components = []
                 individual_nt_xent_losses = {}
-                nt_temperature = cfg.get('loss_weights', {}).get('nt_xent_temperature', 0.1)
+                nt_temperature = cfg['loss_weights'].get('nt_xent_temperature', 0.1)
                 
                 loss_contrast_flip_v = torch.tensor(0.0, device=device)
                 loss_contrast_flip_h = torch.tensor(0.0, device=device)

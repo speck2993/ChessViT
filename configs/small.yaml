@@ -32,7 +32,7 @@ optimiser:
 
 dataset:
   data_dir:     data
-  batch_size:       128
+  batch_size:       300
   grad_accum:       1
   num_workers:      8
   flips:            true
@@ -44,7 +44,7 @@ runtime:
   device:           cuda
   precision:        fp16
   grad_accum:       2
-  max_steps:        4200000
+  max_steps:        3200000
   log_every:        500
   ckpt_every:       50000
   val_every:        20000

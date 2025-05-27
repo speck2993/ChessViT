@@ -177,6 +177,7 @@ class ViTChess(nn.Module):
         policy_head_mlp_hidden_dim: int = 256, # Hidden dim for the CLS bias MLP in policy head
         # New parameter for value head MLP
         value_head_mlp_hidden_dim: Optional[int] = None,
+        value_head_dropout_rate: float = 0.0, # New parameter for value head dropout
         # Added for consistency, though not strictly needed for ViTChess itself if defaults match
         dim_head: Optional[int] = None, # Will be dim // heads if None
     ):
@@ -192,6 +193,7 @@ class ViTChess(nn.Module):
         self.policy_cls_projection_dim = policy_cls_projection_dim
         self.pool_every_k_blocks = pool_every_k_blocks
         self.cls_dropout_rate = cls_dropout_rate
+        self.value_head_dropout_rate = value_head_dropout_rate # Store as instance attribute
 
         # --- Patch + position embedding ------------------------------------
         self.patch_embed = nn.Conv2d(NUM_BITBOARD_PLANES, dim, kernel_size=1)   # per-square 1x1 conv
@@ -229,22 +231,25 @@ class ViTChess(nn.Module):
 
         # --- Prediction Heads ---
         # Helper to create value heads (single Linear or MLP)
-        def create_value_head(input_dim: int, hidden_dim: Optional[int], output_dim: int) -> nn.Module:
+        def create_value_head(input_dim: int, hidden_dim: Optional[int], output_dim: int, dropout_rate: float) -> nn.Module:
             if hidden_dim and hidden_dim > 0:
-                return nn.Sequential(
+                layers = [
                     nn.Linear(input_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, output_dim)
-                )
+                    nn.GELU()
+                ]
+                if dropout_rate > 0:
+                    layers.append(nn.Dropout(p=dropout_rate))
+                layers.append(nn.Linear(hidden_dim, output_dim))
+                return nn.Sequential(*layers)
             else:
                 return nn.Linear(input_dim, output_dim)
 
         # Early Prediction Heads (from CLS token after early_blocks)
-        self.early_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs)
+        self.early_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs, dropout_rate=self.value_head_dropout_rate)
         self.early_material_head = nn.Linear(dim, num_material_categories) # Material head remains a single Linear layer
 
         # Final Prediction Heads
-        self.final_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs)
+        self.final_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs, dropout_rate=self.value_head_dropout_rate)
         self.final_moves_left_head = nn.Linear(dim, num_moves_left_outputs)
 
         # --- New Policy Head Architecture ---
@@ -662,6 +667,7 @@ def load_model_from_checkpoint(
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
         dim_head=cfg['model'].get('dim_head'),
         value_head_mlp_hidden_dim=cfg['model'].get('value_head_mlp_hidden_dim'),
+        value_head_dropout_rate=cfg['model'].get('value_head_dropout_rate', 0.0), # Added this line
     )
     model.to(device)
 
@@ -697,6 +703,7 @@ if __name__ == "__main__":
         policy_head_conv_dim=128,
         policy_head_mlp_hidden_dim=256,
         value_head_mlp_hidden_dim=128, # Example for testing new value head MLP
+        value_head_dropout_rate=0.1, # Example for testing
     )
     
     B = 2 # Batch size

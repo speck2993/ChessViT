@@ -12,6 +12,7 @@ model:
   policy_head_conv_dim: 192
   policy_head_mlp_hidden_dim: 192
   value_head_mlp_hidden_dim: 96
+  value_head_dropout_rate: 0.1
   num_policy_planes: 73
   drop_path: 0.1
 
@@ -25,7 +26,7 @@ loss_weights:
 
 optimiser:
   type:             adamw
-  lr:               1.5e-4
+  lr:               2e-4
   weight_decay:     1e-2
   betas:            [0.9, 0.95]
   sched:            cosine

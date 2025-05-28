@@ -79,6 +79,7 @@ def create_dummy_config(filepath: Path, data_dir: Path, dist_init_path: Path, ou
             'num_policy_planes': 73, 'num_value_outputs': 3, 'num_material_categories': 20,
             'num_moves_left_outputs': 1, 'policy_cls_projection_dim': 32,
             'value_head_mlp_hidden_dim': 32, # Added for the new MLP value head
+            'value_head_dropout_rate': 0.1, # Added for dropout in MLP value head
             'drop_path': 0.0, 'dim_head': None,
         },
         'loss_weights': { 

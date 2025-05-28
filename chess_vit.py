@@ -177,6 +177,8 @@ class ViTChess(nn.Module):
         policy_head_mlp_hidden_dim: int = 256, # Hidden dim for the CLS bias MLP in policy head
         # New parameter for value head MLP
         value_head_mlp_hidden_dim: Optional[int] = None,
+        # New parameter for value head dropout
+        value_head_dropout_rate: float = 0.0,
         # Added for consistency, though not strictly needed for ViTChess itself if defaults match
         dim_head: Optional[int] = None, # Will be dim // heads if None
     ):
@@ -229,22 +231,27 @@ class ViTChess(nn.Module):
 
         # --- Prediction Heads ---
         # Helper to create value heads (single Linear or MLP)
-        def create_value_head(input_dim: int, hidden_dim: Optional[int], output_dim: int) -> nn.Module:
+        def create_value_head(input_dim: int, hidden_dim: Optional[int], output_dim: int, dropout_rate: float) -> nn.Module:
             if hidden_dim and hidden_dim > 0:
-                return nn.Sequential(
+                layers = [
                     nn.Linear(input_dim, hidden_dim),
                     nn.GELU(),
-                    nn.Linear(hidden_dim, output_dim)
-                )
+                ]
+                if dropout_rate > 0.0:
+                    layers.append(nn.Dropout(dropout_rate))
+                layers.append(nn.Linear(hidden_dim, output_dim))
+                return nn.Sequential(*layers)
             else:
+                # If no hidden_dim, dropout is not typically applied to a single linear layer head.
+                # If dropout is desired even for a single linear layer, this logic would need adjustment.
                 return nn.Linear(input_dim, output_dim)
 
         # Early Prediction Heads (from CLS token after early_blocks)
-        self.early_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs)
+        self.early_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs, value_head_dropout_rate)
         self.early_material_head = nn.Linear(dim, num_material_categories) # Material head remains a single Linear layer
 
         # Final Prediction Heads
-        self.final_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs)
+        self.final_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs, value_head_dropout_rate)
         self.final_moves_left_head = nn.Linear(dim, num_moves_left_outputs)
 
         # --- New Policy Head Architecture ---
@@ -316,7 +323,7 @@ class ViTChess(nn.Module):
                               rep2: torch.Tensor,
                               is_lichess: torch.Tensor):
         """
-        Efficient batched forward pass for multiple board variants.
+        Efficient batched forward pass for multiple board variants through early blocks.
         
         Args:
             bitboards_list: List of [original, v_flip, h_flip, hv_flip] tensors
@@ -325,7 +332,9 @@ class ViTChess(nn.Module):
             rep1, rep2, is_lichess: Same for all variants
         
         Returns:
-            List of CLS features for each variant
+            Tuple[List[torch.Tensor], torch.Tensor]: 
+                - List of CLS features (normed and dropout-applied) for each variant.
+                - The raw 'x' tensor (total_B, 65, dim) for ALL variants after early blocks (before norm_early).
         """
         # Stack all variants into a single batch
         all_bitboards = torch.cat(bitboards_list, dim=0)
@@ -334,38 +343,39 @@ class ViTChess(nn.Module):
         total_B = B_per_variant * num_variants
         
         # Patch embed all at once
-        x = self.patch_embed(all_bitboards)  # (total_B, dim, 8, 8)
-        x = x.flatten(2).transpose(1, 2)     # (total_B, 64, dim)
+        x_patches_all = self.patch_embed(all_bitboards)  # (total_B, dim, 8, 8)
+        x_patches_all = x_patches_all.flatten(2).transpose(1, 2)     # (total_B, 64, dim)
         
         # Create CLS tokens for all variants
-        cls = self.cls_token.expand(total_B, -1, -1)  # (total_B, 1, dim)
+        cls_all = self.cls_token.expand(total_B, -1, -1)  # (total_B, 1, dim)
         
         # Apply variant-specific biases
         if is960_list is not None:
             is960_all = torch.cat(is960_list, dim=0)
-            cls = cls + is960_all.view(-1, 1, 1).float() * self.chess960_bias
+            cls_all = cls_all + is960_all.view(-1, 1, 1).float() * self.chess960_bias
         
         if stm_list is not None:
             stm_all = torch.cat(stm_list, dim=0)
-            stm_sign = stm_all.float() * 2.0 - 1.0
-            cls = cls + stm_sign.view(-1, 1, 1) * self.stm_bias
+            # Correct STM bias application: 0 for black -> subtract, 1 for white -> add
+            stm_sign = stm_all.float() * 2.0 - 1.0 # Converts 0,1 to -1,1
+            cls_all = cls_all + stm_sign.view(-1, 1, 1) * self.stm_bias
         
         # Apply shared biases (same for all variants)
         if rep1 is not None:
-            rep1_expanded = rep1.repeat(num_variants)
-            cls = cls + rep1_expanded.view(-1, 1, 1).float() * self.rep1_bias
+            rep1_expanded = rep1.repeat_interleave(num_variants) # Corrected: repeat for each variant
+            cls_all = cls_all + rep1_expanded.view(-1, 1, 1).float() * self.rep1_bias
         
         if rep2 is not None:
-            rep2_expanded = rep2.repeat(num_variants)
-            cls = cls + rep2_expanded.view(-1, 1, 1).float() * self.rep2_bias
+            rep2_expanded = rep2.repeat_interleave(num_variants) # Corrected: repeat for each variant
+            cls_all = cls_all + rep2_expanded.view(-1, 1, 1).float() * self.rep2_bias
         
         if is_lichess is not None:
-            is_lichess_expanded = is_lichess.repeat(num_variants)
-            cls = cls + is_lichess_expanded.view(-1, 1, 1).float() * self.lichess_source_bias
+            is_lichess_expanded = is_lichess.repeat_interleave(num_variants) # Corrected: repeat for each variant
+            cls_all = cls_all + is_lichess_expanded.view(-1, 1, 1).float() * self.lichess_source_bias
         
         # Concatenate and add positional embeddings
-        x = torch.cat([cls, x], dim=1)  # (total_B, 65, dim)
-        x = x + self.pos_embed
+        x = torch.cat([cls_all, x_patches_all], dim=1)  # (total_B, 65, dim)
+        x = x + self.pos_embed # pos_embed is (1, 65, dim), broadcasts
         
         # Process through early blocks
         for i in range(self.early_depth_count):
@@ -374,14 +384,15 @@ class ViTChess(nn.Module):
             x_for_block = torch.cat([cls_dropped, patches_input], dim=1)
             x = self.blocks[i](x_for_block)
         
-        # Extract and normalize CLS features
-        x_norm_early = self.norm_early(x)
-        cls_features = self.cls_dropout(x_norm_early[:, 0])  # (total_B, dim)
+        x_after_early_blocks_raw = x 
         
-        # Split back into separate variants
-        cls_features_list = cls_features.chunk(num_variants, dim=0)
+        # Process for CLS features for contrastive loss (normed and dropout applied)
+        x_norm_early = self.norm_early(x_after_early_blocks_raw)
+        cls_features_normed_dropped = self.cls_dropout(x_norm_early[:, 0])
         
-        return cls_features_list
+        cls_features_list = list(cls_features_normed_dropped.chunk(num_variants, dim=0))
+        
+        return cls_features_list, x_after_early_blocks_raw
 
     # ---------------------------------------------------------------------
     # forward
@@ -395,173 +406,156 @@ class ViTChess(nn.Module):
                 flipped_bitboards_v: Optional[torch.Tensor] = None,
                 flipped_bitboards_h: Optional[torch.Tensor] = None,
                 flipped_bitboards_hv: Optional[torch.Tensor] = None):
-        """Args:
-            bitboards: (B, 14, 8, 8) float16/32.
-            is960: (B,) float tensor — 1 if starting position is Chess960.
-            stm: (B,) float tensor — 1 if side to move is White.
-            rep1: (B,) float tensor — 1 if repetition count >= 1.
-            rep2: (B,) float tensor — 1 if repetition count >= 2.
-            is_lichess: (B,) float tensor - 1 if from Lichess source.
-            flipped_bitboards_v: Optional (B, 14, 8, 8) vertically flipped.
-            flipped_bitboards_h: Optional (B, 14, 8, 8) horizontally flipped.
-            flipped_bitboards_hv: Optional (B, 14, 8, 8) both H & V flipped.
-        """
-        outputs = {}
 
-        # --- Process flipped boards for contrastive loss (early blocks only) ---
-        contrastive_variants = [bitboards]
-        # Ensure inputs are float for consistent processing
+        outputs = {}
+        B = bitboards.size(0)
+        # Ensure inputs for biases are float
         f_is960 = is960.float()
         f_stm = stm.float()
+        f_rep1 = rep1.float()
+        f_rep2 = rep2.float()
+        f_is_lichess = is_lichess.float()
 
+        x_after_early_processing: Optional[torch.Tensor] = None
+        start_block_idx = 0
+        # H_patches, W_patches will be set before policy head, default to 8,8
+        H_patches, W_patches = 8, 8 
+
+        contrastive_variants_bitboards = [bitboards]
         is960_variants = [f_is960]
         stm_variants = [f_stm]
 
         if flipped_bitboards_v is not None:
-            contrastive_variants.append(flipped_bitboards_v)
+            contrastive_variants_bitboards.append(flipped_bitboards_v)
             is960_variants.append(f_is960)  # is960 same for v_flip
-            stm_variants.append(1.0 - f_stm)  # Toggle STM
+            stm_variants.append(1.0 - f_stm)  # Toggle STM (0->1, 1->0)
 
         if flipped_bitboards_h is not None:
-            contrastive_variants.append(flipped_bitboards_h)
-            is960_variants.append(torch.ones_like(f_is960))  # Force 960
+            contrastive_variants_bitboards.append(flipped_bitboards_h)
+            is960_variants.append(torch.ones_like(f_is960))  # Force 960 for h_flip
             stm_variants.append(f_stm)  # stm same for h_flip
 
         if flipped_bitboards_hv is not None:
-            contrastive_variants.append(flipped_bitboards_hv)
-            is960_variants.append(torch.ones_like(f_is960))  # Force 960
+            contrastive_variants_bitboards.append(flipped_bitboards_hv)
+            is960_variants.append(torch.ones_like(f_is960))  # Force 960 for hv_flip
             stm_variants.append(1.0 - f_stm)  # Toggle STM
 
-        if len(contrastive_variants) > 1:
-            cls_features_all = self.forward_batch_contrastive(
-                contrastive_variants, is960_variants, stm_variants, 
-                rep1, rep2, is_lichess
+        if len(contrastive_variants_bitboards) > 1:
+            cls_features_all_variants, x_all_variants_after_early_blocks_raw = self.forward_batch_contrastive(
+                contrastive_variants_bitboards, is960_variants, stm_variants, 
+                f_rep1, f_rep2, f_is_lichess
             )
-            outputs["early_cls"] = cls_features_all[0]
+            
+            # CLS features for original board (already normed & dropout from forward_batch_contrastive)
+            original_cls_early_processed = cls_features_all_variants[0]
+            outputs["early_cls"] = original_cls_early_processed
+            outputs["early_value"] = self.early_value_head(original_cls_early_processed)
+            outputs["early_material"] = self.early_material_head(original_cls_early_processed)
+
+            # Store the raw processed 'x' for the original bitboards to continue the main path
+            x_after_early_processing = x_all_variants_after_early_blocks_raw[:B, :, :]
+            start_block_idx = self.early_depth_count 
+
+            # Populate other contrastive outputs
             current_idx = 1
             if flipped_bitboards_v is not None:
-                outputs["contrastive_cls_v_flip"] = cls_features_all[current_idx]
+                outputs["contrastive_cls_v_flip"] = cls_features_all_variants[current_idx]
                 current_idx += 1
             if flipped_bitboards_h is not None:
-                outputs["contrastive_cls_h_flip"] = cls_features_all[current_idx]
+                outputs["contrastive_cls_h_flip"] = cls_features_all_variants[current_idx]
                 current_idx += 1
             if flipped_bitboards_hv is not None:
-                outputs["contrastive_cls_hv_flip"] = cls_features_all[current_idx]
-        else: # Only original board, no flips
-            outputs["early_cls"] = self.get_early_block_cls_features(
-                bitboards, is960, stm, rep1, rep2, is_lichess
-            )
+                outputs["contrastive_cls_hv_flip"] = cls_features_all_variants[current_idx]
+        
+        # --- Main Path --- 
+        if x_after_early_processing is not None:
+            x = x_after_early_processing
+            # H_patches, W_patches for policy head would be from the patch_embed in forward_batch_contrastive
+            # Assuming 8x8 for now if not explicitly passed back / tracked.
+            # This could be made more robust if patch_embed output dims vary.
+        else:
+            # This path runs if no flipped variants were provided.
+            x_patches_embedded = self.patch_embed(bitboards) # (B, dim, H, W)
+            _, self.dim, H_patches, W_patches = x_patches_embedded.shape # self.dim should match C_dim from ViT init
+            x_patches_flattened = x_patches_embedded.flatten(2).transpose(1, 2) # (B, H*W, dim)
 
-        # --- Main Path: Initial Embedding & Positional Encoding ------------
-        B = bitboards.size(0)
-        x = self.patch_embed(bitboards)      # (B, dim, 8, 8)
-        # Store original H, W for unflattening later if needed for policy MLP input
-        _, C_dim, H_patches, W_patches = x.shape
-        x = x.flatten(2).transpose(1, 2)             # (B, 64, dim)
+            cls = self.cls_token.expand(B, -1, -1) # (B, 1, dim)
+            cls = cls + f_is960.view(-1, 1, 1) * self.chess960_bias
+            # Correct STM bias application: 0 for black -> subtract, 1 for white -> add
+            stm_sign = f_stm.float() * 2.0 - 1.0 
+            cls = cls + stm_sign.view(-1, 1, 1) * self.stm_bias
+            cls = cls + f_rep1.view(-1, 1, 1) * self.rep1_bias
+            cls = cls + f_rep2.view(-1, 1, 1) * self.rep2_bias
+            cls = cls + f_is_lichess.view(-1, 1, 1) * self.lichess_source_bias
 
-        cls = self.cls_token.expand(B, -1, -1)       # (B, 1, dim)
-        # Add global flag biases
-        cls = cls + is960.view(-1, 1, 1).float() * self.chess960_bias
-        cls = cls + stm.view(-1, 1, 1).float() * 2.0 * self.stm_bias - self.stm_bias
-        cls = cls + rep1.view(-1, 1, 1).float() * self.rep1_bias
-        cls = cls + rep2.view(-1, 1, 1).float() * self.rep2_bias
-        cls = cls + is_lichess.view(-1, 1, 1).float() * self.lichess_source_bias
+            x = torch.cat([cls, x_patches_flattened], dim=1) # (B, 1 + H*W, dim)
+            x = x + self.pos_embed # self.pos_embed is (1, 1 + H*W, dim)
+            # start_block_idx is already 0
 
-        x = torch.cat([cls, x], dim=1)               # (B, 65, dim)
-        x = x + self.pos_embed                       # Add pos-emb
-
-        # --- Unified Transformer Blocks Processing ---
-        alpha_idx_counter = 0
-        for d in range(self.depth):
+        # --- Unified Transformer Blocks Processing (Main Path continued) ---
+        alpha_idx_counter = 0 
+        for d in range(start_block_idx, self.depth):
             cls_input_to_block, patches_input_to_block = x[:, :1], x[:, 1:]
-            # Apply CLS dropout before it enters a block
             cls_dropped_for_block = self.cls_dropout(cls_input_to_block)
             x_for_block = torch.cat([cls_dropped_for_block, patches_input_to_block], dim=1)
             
-            x = self.blocks[d](x_for_block) # Output of block d
+            x = self.blocks[d](x_for_block)
 
-            # Early heads application
-            if (d + 1) == self.early_depth_count:
-                x_normed_early = self.norm_early(x) # x is raw output of block[d]
+            # Early heads application (only if these blocks are being run by the main path *and* not already populated)
+            if (d + 1) == self.early_depth_count and start_block_idx < self.early_depth_count:
+                # This ensures early heads are computed if contrastive path didn't run
+                x_normed_early = self.norm_early(x) 
                 cls_token_early_norm, _ = x_normed_early[:, :1], x_normed_early[:, 1:]
-                # Apply dropout before feeding to early heads
-                cls_token_early_processed = self.cls_dropout(cls_token_early_norm)
+                cls_token_early_processed = self.cls_dropout(cls_token_early_norm).squeeze(1)
                 
-                outputs["early_value"] = self.early_value_head(cls_token_early_processed.squeeze(1))
-                outputs["early_material"] = self.early_material_head(cls_token_early_processed.squeeze(1))
-                outputs["early_cls"] = cls_token_early_processed.squeeze(1) # For contrastive loss
+                outputs["early_value"] = self.early_value_head(cls_token_early_processed)
+                outputs["early_material"] = self.early_material_head(cls_token_early_processed)
+                outputs["early_cls"] = cls_token_early_processed
 
             # Periodic pooling into CLS token
             if self.pool_every_k_blocks is not None and \
                (d + 1) % self.pool_every_k_blocks == 0 and \
-               d < self.depth - 1: # Ensure not after the last block
+               d < self.depth - 1: 
                 
-                cls_from_block, patches_from_block = x[:, :1], x[:, 1:] # x is raw output of block[d]
-                
-                # CLS token that receives the pool might also be subject to dropout implicitly
-                # as the cls_from_block is the result of a block that took a dropped CLS as input.
-                # Or, we can apply dropout explicitly to cls_from_block before pooling.
-                # The current setup has dropout on input to blocks.
-                # For consistency with "dropout on CLS token", the CLS part of `x` (output of block) is used.
-
+                cls_from_block, patches_from_block = x[:, :1], x[:, 1:]
                 mean_pooled_patches = torch.mean(patches_from_block, dim=1, keepdim=True)
                 current_alpha = self.alphas[alpha_idx_counter]
                 alpha_idx_counter += 1
                 
-                # The cls_from_block is the direct output.
-                # If dropout is applied before block, this cls_from_block is influenced by that.
-                # No additional dropout on cls_from_block before pooling here, to avoid double dropout if not intended.
                 cls_updated_by_pool = cls_from_block + current_alpha * mean_pooled_patches
                 x = torch.cat([cls_updated_by_pool, patches_from_block], dim=1)
         
         # --- Final Layer Norm and Final Heads ---
-        x_norm_final = self.norm_final(x) # x is raw output of the last block (or pooled if last block was a pool point)
-        
+        x_norm_final = self.norm_final(x)
         cls_final_features_norm, patch_final_features_norm = x_norm_final[:, :1], x_norm_final[:, 1:]
-        # Apply dropout before final heads
         cls_final_features_processed = self.cls_dropout(cls_final_features_norm).squeeze(1)
-        patch_final_features = patch_final_features_norm # Patches are already normed
+        patch_final_features = patch_final_features_norm 
 
         outputs["final_value"] = self.final_value_head(cls_final_features_processed)
         outputs["final_moves_left"] = self.final_moves_left_head(cls_final_features_processed)
 
-        # --- New Policy Head Forward Pass ---
-        # patch_final_features is (B, 64, dim) - from x_norm_final[:, 1:]
-        # cls_final_features_processed is (B, dim) - from self.cls_dropout(x_norm_final[:, 0]).squeeze(1)
-
-        # 1. Reshape patch tokens to (B, dim, H_patches, W_patches)
-        # H_patches, W_patches were stored earlier, assume they are 8, 8 for chess
-        # We have patch_final_features = patch_final_features_norm from earlier (B, 64, dim)
+        # --- Policy Head --- 
+        # patch_final_features is (B, H*W, dim)
+        # H_patches, W_patches should be available from the 'else' block of the main path init
+        # or defaulted to 8,8 if contrastive path was taken and they were not explicitly passed.
         policy_input_spatial = patch_final_features.transpose(1, 2).reshape(
-            B, self.dim, H_patches, W_patches
-        ) # (B, dim, 8, 8)
+            B, self.dim, H_patches, W_patches # self.dim is embedding dim C
+        ) 
 
-        # 2. First two convolutions
         x_policy = self.policy_conv1(policy_input_spatial)
-        x_policy = self.policy_gelu1(x_policy) # (B, policy_head_conv_dim, 8, 8)
+        x_policy = self.policy_gelu1(x_policy) 
         conv2_out = self.policy_conv2(x_policy)
-        conv2_out_activated = self.policy_gelu2(conv2_out) # (B, policy_head_conv_dim, 8, 8)
+        conv2_out_activated = self.policy_gelu2(conv2_out) 
 
-        # 3. CLS Token Bias Integration
-        # Reshape conv2_out_activated for MLP: (B, policy_head_conv_dim, 64) -> (B, 64, policy_head_conv_dim)
-        conv2_out_flat = conv2_out_activated.flatten(2).transpose(1, 2) # (B, 64, policy_head_conv_dim)
-
-        # Expand CLS token (cls_final_features_processed is (B, dim))
-        cls_expanded_for_bias_mlp = cls_final_features_processed.unsqueeze(1).expand(-1, H_patches * W_patches, -1) # (B, 64, dim)
-
-        # Concatenate for MLP input
-        mlp_input = torch.cat([conv2_out_flat, cls_expanded_for_bias_mlp], dim=2) # (B, 64, policy_head_conv_dim + dim)
-        
-        cls_bias_values = self.cls_bias_mlp(mlp_input) # (B, 64, policy_head_conv_dim)
-
-        # Add bias and reshape back to spatial
+        conv2_out_flat = conv2_out_activated.flatten(2).transpose(1, 2)
+        cls_expanded_for_bias_mlp = cls_final_features_processed.unsqueeze(1).expand(-1, H_patches * W_patches, -1)
+        mlp_input = torch.cat([conv2_out_flat, cls_expanded_for_bias_mlp], dim=2)
+        cls_bias_values = self.cls_bias_mlp(mlp_input) 
         conv2_out_biased_flat = conv2_out_flat + cls_bias_values
         conv2_out_biased_spatial = conv2_out_biased_flat.transpose(1, 2).reshape(
-            B, -1, H_patches, W_patches # -1 should resolve to policy_head_conv_dim
-        ) # (B, policy_head_conv_dim, 8, 8)
-
-        # 4. Final convolution
-        outputs["policy"] = self.policy_conv3(conv2_out_biased_spatial) # (B, num_policy_planes, 8, 8)
+            B, -1, H_patches, W_patches 
+        ) 
+        outputs["policy"] = self.policy_conv3(conv2_out_biased_spatial)
         
         return outputs
 
@@ -662,6 +656,7 @@ def load_model_from_checkpoint(
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
         dim_head=cfg['model'].get('dim_head'),
         value_head_mlp_hidden_dim=cfg['model'].get('value_head_mlp_hidden_dim'),
+        value_head_dropout_rate=cfg['model'].get('value_head_dropout_rate', 0.0)
     )
     model.to(device)
 
@@ -697,6 +692,7 @@ if __name__ == "__main__":
         policy_head_conv_dim=128,
         policy_head_mlp_hidden_dim=256,
         value_head_mlp_hidden_dim=128, # Example for testing new value head MLP
+        value_head_dropout_rate=0.1 # Example for testing dropout
     )
     
     B = 2 # Batch size

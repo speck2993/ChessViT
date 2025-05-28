@@ -67,6 +67,8 @@ def load_config(path: str) -> dict:
         cfg['model']['num_moves_left_outputs'] = int(cfg['model']['num_moves_left_outputs'])
     if 'policy_cls_projection_dim' in cfg['model'] and cfg['model']['policy_cls_projection_dim'] is not None:
         cfg['model']['policy_cls_projection_dim'] = int(cfg['model']['policy_cls_projection_dim'])
+    if 'value_head_mlp_hidden_dim' in cfg['model'] and cfg['model']['value_head_mlp_hidden_dim'] is not None:
+        cfg['model']['value_head_mlp_hidden_dim'] = int(cfg['model']['value_head_mlp_hidden_dim'])
     # Note: policy_mlp_hidden_dim (from ViTChess init) might be policy_head_mlp_hidden_dim in config
     # This is handled by using cfg_model.get('policy_head_mlp_hidden_dim') later.
 
@@ -422,7 +424,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
             loss_contrast = avg_flip_loss # Default to average of flip losses for eval
 
             lw = loss_weights_cfg
-            total_loss += (
+            total_loss = (
                 lw['policy'] * loss_policy +
                 lw['value'] * loss_value +
                 lw['moves_left'] * loss_moves +

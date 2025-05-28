@@ -661,7 +661,7 @@ def load_model_from_checkpoint(
     model.to(device)
 
     # 5) restore weights from safetensors
-    state_dict = load_file(checkpoint_prefix + ".safetensors", device=device)
+    state_dict = load_file(checkpoint_prefix + ".safetensors", device=str(device))
     model.load_state_dict(state_dict)
 
     # 6) switch to eval mode

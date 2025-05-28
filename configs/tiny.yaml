@@ -12,7 +12,7 @@ model:
   policy_head_conv_dim: 192
   policy_head_mlp_hidden_dim: 192
   value_head_mlp_hidden_dim: 96
-  value_head_dropout_rate: 0.1
+  value_head_dropout_rate: 0.2
   num_policy_planes: 73
   drop_path: 0.1
 

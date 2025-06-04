@@ -26,7 +26,7 @@ python pgn_splitter.py \
 """
 from __future__ import annotations
 
-import argparse, os, sys, gzip, bz2, tarfile, queue, time, logging, re, io
+import argparse, os, sys, gzip, bz2, tarfile, queue, time, logging, re, io, hashlib, random
 from pathlib import Path
 from multiprocessing import Pool, Manager, current_process
 import chess.pgn  # type: ignore
@@ -121,84 +121,145 @@ def open_pgn_stream(path: Path):
 
 # ───────────────────────────── Worker routine ─────────────────────────────────
 
-def worker(job_q, out_dir: str, games_per_chunk: int, stats_dict):
+def worker(job_q, out_dir: str, games_per_chunk: int, stats_dict, 
+           test_suffixes_set: set[str], test_set_hash_chars: int, is_test_split_active: bool):
     out_base = Path(out_dir)
     pid = current_process()._identity[0] if current_process()._identity else 0
-    chunk_id = 0
+    
+    # Per-worker, per-split-type chunk ID and line buffers
+    chunk_id_train = 0
+    chunk_id_test = 0
+    out_lines_train: list[str] = []
+    out_lines_test: list[str] = []
+    gcount_train = 0
+    gcount_test = 0
 
     while True:
         try:
-            src_path = job_q.get_nowait()
+            src_path_str = job_q.get_nowait()
         except queue.Empty:
             break
 
-        src_path = Path(src_path)
-        is_lichess_file = bool(LICHESS_RE.search(src_path.name))
-        label = "lichess" if is_lichess_file else "lc0"
+        src_path = Path(src_path_str)
+        is_lichess_file_label = bool(LICHESS_RE.search(src_path.name))
+        label = "lichess" if is_lichess_file_label else "lc0"
 
-        # Initialize accumulation variables for this source file
-        gcount = 0
-        out_lines = []
-        
         for inner_name, stream in open_pgn_stream(src_path):
+            # inner_name from open_pgn_stream could be different from src_path.name if it's a tar member
+            # For the Lichess/LC0 label, src_path.name (the original file/archive) is more indicative.
+            # For filtering (is_good_lichess), the game headers are what matter.
+
             for game in iter(lambda: chess.pgn.read_game(stream), None):
-                if is_lichess_file and not is_good_lichess(game):
+                if is_lichess_file_label and not is_good_lichess(game):
                     continue
-                out_lines.append(str(game) + "\n\n")
-                gcount += 1
-                if gcount >= games_per_chunk:
-                    write_chunk(out_base, label, pid, chunk_id, out_lines)
-                    stats_dict[label] += gcount
-                    chunk_id += 1
-                    gcount = 0
-                    out_lines.clear()
+
+                game_pgn_str = str(game) + "\n\n" # Ensure double newline for PGN standard
+                current_data_split_type = "train"
+
+                if is_test_split_active and test_suffixes_set: # Only hash if test splitting is on
+                    game_hash = hashlib.sha1(game_pgn_str.encode('utf-8', errors='ignore')).hexdigest()
+                    suffix = game_hash[-test_set_hash_chars:]
+                    if suffix in test_suffixes_set:
+                        current_data_split_type = "test"
+                
+                stats_dict["total_games_processed"] += 1 # Increment for overall progress monitoring
+
+                if current_data_split_type == "train":
+                    out_lines_train.append(game_pgn_str)
+                    gcount_train += 1
+                    if gcount_train >= games_per_chunk:
+                        write_chunk(out_base, label, pid, chunk_id_train, out_lines_train, "train")
+                        stats_dict[label + "_train"] += gcount_train
+                        chunk_id_train += 1
+                        gcount_train = 0
+                        out_lines_train.clear()
+                else: # Test game
+                    out_lines_test.append(game_pgn_str)
+                    gcount_test += 1
+                    if gcount_test >= games_per_chunk:
+                        write_chunk(out_base, label, pid, chunk_id_test, out_lines_test, "test")
+                        stats_dict[label + "_test"] += gcount_test
+                        chunk_id_test += 1
+                        gcount_test = 0
+                        out_lines_test.clear()
+
             if hasattr(stream, "close"):
                 stream.close()
         
-        # Write any remaining games from this source file
-        if gcount > 0:
-            write_chunk(out_base, label, pid, chunk_id, out_lines)
-            stats_dict[label] += gcount
-            chunk_id += 1
-            out_lines.clear()
+        # Flush remaining games from this source file for both splits
+        if gcount_train > 0:
+            write_chunk(out_base, label, pid, chunk_id_train, out_lines_train, "train")
+            stats_dict[label + "_train"] += gcount_train
+            chunk_id_train += 1
+            gcount_train = 0 # Reset counter
+            out_lines_train.clear()
+        
+        if gcount_test > 0:
+            write_chunk(out_base, label, pid, chunk_id_test, out_lines_test, "test")
+            stats_dict[label + "_test"] += gcount_test
+            chunk_id_test += 1
+            gcount_test = 0 # Reset counter
+            out_lines_test.clear()
             
         print(f"[W{pid}] Finished {src_path}")
 
 
-def write_chunk(base: Path, label: str, wid: int, cid: int, lines):
-    dst = base / label
-    dst.mkdir(parents=True, exist_ok=True)
-    name = dst / f"chunk_{label}_{wid:02d}_{cid:06d}.pgn"
-    with open(name, "w", encoding="utf-8") as f:
+def write_chunk(base_output_dir: Path, label: str, worker_id: int, chunk_idx: int, lines: list[str], data_split_type: str):
+    # Construct path: base_output_dir / data_split_type / label / chunk_...
+    # e.g., shards/train/lichess/chunk_lichess_00_000000.pgn
+    target_dir = base_output_dir / data_split_type / label
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Filename itself does not need data_split_type, its location determines it.
+    file_name = target_dir / f"chunk_{label}_{worker_id:02d}_{chunk_idx:06d}.pgn"
+    
+    with open(file_name, "w", encoding="utf-8") as f:
         f.writelines(lines)
-    print(f"[W{wid}] wrote {name} ({len(lines)} games)")
+    print(f"[W{worker_id}] wrote {file_name} ({len(lines)} games to {data_split_type}/{label}) ")
 
 
 # ──────────────────────────── Progress monitoring ───────────────────────────────
 
-def progress_monitor(stats_dict, report_interval=10):
+def progress_monitor(stats_dict, stop_event, report_interval=10):
     """Monitor processing progress and print games/second periodically."""
-    prev_total = 0
+    prev_total_processed = 0 # Use the new total_games_processed stat
     prev_time = time.time()
     
     while True:
-        time.sleep(report_interval)
+        # Wait for the event to be set or for the timeout
+        # If event is set during wait, wait() returns True.
+        # If timeout occurs, wait() returns False.
+        if stop_event.wait(timeout=report_interval):
+            break  # Event was set, exit loop
+
+        # Timeout occurred, event not set, so do the work
         current_time = time.time()
-        current_total = stats_dict.get("lichess", 0) + stats_dict.get("lc0", 0)
+        current_total_processed = stats_dict.get("total_games_processed", 0)
         
-        if current_total > prev_total:
+        # Gather current train/test counts for detailed logging
+        lichess_train_count = stats_dict.get("lichess_train", 0)
+        lc0_train_count = stats_dict.get("lc0_train", 0)
+        lichess_test_count = stats_dict.get("lichess_test", 0)
+        lc0_test_count = stats_dict.get("lc0_test", 0)
+        total_train_current = lichess_train_count + lc0_train_count
+        total_test_current = lichess_test_count + lc0_test_count
+        
+        if current_total_processed > prev_total_processed:
             elapsed = current_time - prev_time
-            games_processed = current_total - prev_total
-            rate = games_processed / elapsed if elapsed > 0 else 0
+            games_processed_interval = current_total_processed - prev_total_processed
+            rate = games_processed_interval / elapsed if elapsed > 0 else 0
             
-            print(f"[PROGRESS] Total games: {current_total:,} | Rate: {rate:,.0f} games/sec | "
-                  f"Lichess: {stats_dict.get('lichess', 0):,} | LC0: {stats_dict.get('lc0', 0):,}")
+            print(f"[PROGRESS] Total Processed: {current_total_processed:,} | Rate: {rate:,.0f} games/sec | "
+                  f"Train (L:{lichess_train_count:,}, LC0:{lc0_train_count:,}) = {total_train_current:,} | "
+                  f"Test (L:{lichess_test_count:,}, LC0:{lc0_test_count:,}) = {total_test_current:,}")
             
-            prev_total = current_total
+            prev_total_processed = current_total_processed
             prev_time = current_time
-        elif current_total == prev_total and current_total > 0:
-            # No progress made, might be finishing up
-            print(f"[PROGRESS] Total games: {current_total:,} | Processing...")
+        elif current_total_processed > 0: # No new games, but some have been processed
+            print(f"[PROGRESS] Total Processed: {current_total_processed:,} | Processing... | "
+                  f"Train (L:{lichess_train_count:,}, LC0:{lc0_train_count:,}) = {total_train_current:,} | "
+                  f"Test (L:{lichess_test_count:,}, LC0:{lc0_test_count:,}) = {total_test_current:,}")
+    print("[PROGRESS_MONITOR] Stop signal received, exiting.")
 
 
 # ──────────────────────────── Main orchestrator ───────────────────────────────
@@ -211,51 +272,107 @@ def collect_source_files(in_dir: Path):
 def main():
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--in-dir", default="raw_data", help="Directory with raw PGN / tar files")
-    ap.add_argument("--out-dir", default="shards", help="Output directory for shards")
+    ap.add_argument("--out-dir", default="shards", help="Output directory for shards. Will contain \'train\' and \'test\' subdirs.")
     ap.add_argument("--games-per-chunk", type=int, default=5000)
     ap.add_argument("--workers", type=int, default=os.cpu_count())
+    
+    # Test set arguments (mirrored from preprocess_tensors.py logic)
+    ap.add_argument("--test-fraction", type=float, default=0.0,
+                    help="Fraction of games to allocate to the test set (e.g., 0.1 for 10%). "
+                         "If 0, no test set is created. Default: 0.0")
+    ap.add_argument("--test-set-seed", type=int, default=42,
+                    help="RNG seed for selecting games for the test set, ensuring reproducibility. Default: 42")
+    ap.add_argument("--test-set-hash-chars", type=int, default=2, choices=[2, 3, 4],
+                    help="Number of trailing hex characters from SHA1 hash of PGN game string to use for train/test split. "
+                         "2 chars = 256 buckets, 3 chars = 4096, 4 chars = 65536. Default: 2")
     args = ap.parse_args()
 
     in_dir  = Path(args.in_dir)
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Base output directory will be created by write_chunk as needed (e.g., out_dir/train/label)
+    # out_dir.mkdir(parents=True, exist_ok=True) # No longer creating main out_dir here
 
     files = collect_source_files(in_dir)
     if not files:
         print("No PGN-compatible files found.")
         sys.exit(1)
 
+    # Generate test set suffixes if test_fraction > 0
+    selected_test_suffixes_set = set()
+    if args.test_fraction > 0:
+        if not (0 < args.test_fraction < 1):
+            print("Error: --test_fraction must be between 0 (exclusive, if creating test set) and 1. Disabling test set.", file=sys.stderr)
+            args.test_fraction = 0.0
+        else:
+            num_chars = args.test_set_hash_chars
+            possible_suffixes = [f"{i:0{num_chars}x}" for i in range(16**num_chars)]
+            num_to_select = int(round(len(possible_suffixes) * args.test_fraction))
+            
+            if num_to_select == 0 and args.test_fraction > 0:
+                num_to_select = 1 # Select at least one suffix
+            
+            if num_to_select > len(possible_suffixes):
+                print(f"Warning: Requested test_fraction {args.test_fraction} results in selecting all {len(possible_suffixes)} "
+                                f"possible suffixes for {num_chars} hash characters. Test set will effectively be the entire dataset.", file=sys.stderr)
+                selected_test_suffixes_set = set(possible_suffixes)
+            elif num_to_select > 0:
+                rng_test_set = random.Random(args.test_set_seed)
+                selected_test_suffixes_list = rng_test_set.sample(possible_suffixes, num_to_select)
+                selected_test_suffixes_set = set(selected_test_suffixes_list)
+                print(f"Info: Selected {len(selected_test_suffixes_set)} suffixes for the test set using {num_chars} hash chars "
+                             f"(approx. {args.test_fraction*100:.2f}% of games). Seed: {args.test_set_seed}")
+            else:
+                print("Info: Test fraction is too small to select any suffixes, no test set will be generated.")
+                args.test_fraction = 0.0
+
+
     print(f"Found {len(files)} source files. Spawning {args.workers} workers …")
     manager = Manager()
     q = manager.Queue()
-    stats = manager.dict(lichess=0, lc0=0)
+    # Update stats to track train/test separately
+    stats = manager.dict(lichess_train=0, lc0_train=0, lichess_test=0, lc0_test=0, total_games_processed=0)
+    stop_monitor_event = manager.Event() # Create event for stopping the monitor
     for p in files:
         q.put(p)
 
     t0 = time.time()
     with Pool(processes=args.workers) as pool:
-        # Start progress monitor in a separate process
-        monitor_process = pool.apply_async(progress_monitor, (stats,))
+        # Pass the stop_monitor_event to progress_monitor
+        monitor_async_result = pool.apply_async(progress_monitor, (stats, stop_monitor_event))
         
-        # Start worker processes
         worker_results = []
         for _ in range(args.workers):
-            result = pool.apply_async(worker, (q, str(out_dir), args.games_per_chunk, stats))
+            # Pass test split params to worker
+            result = pool.apply_async(worker, (q, str(out_dir), args.games_per_chunk, stats, 
+                                               selected_test_suffixes_set, args.test_set_hash_chars, args.test_fraction > 0))
             worker_results.append(result)
         
-        # Wait for all workers to complete
         for result in worker_results:
             result.wait()
         
-        # Terminate the monitor process
-        monitor_process.terminate()
+        stop_monitor_event.set() # Signal the progress_monitor to stop
+        # monitor_async_result.get() # Optionally wait for monitor to finish, good for catching exceptions from it
         pool.close()
         pool.join()
     dt = time.time() - t0
 
-    total = stats["lichess"] + stats["lc0"]
-    print(f"Done. Lichess games: {stats['lichess']:,}  Lc0 games: {stats['lc0']:,}")
-    print(f"Shards written: {len(list(out_dir.rglob('*.pgn'))):,}  in {dt/60:.1f} min ≈ {total/dt:,.0f} games/s")
+    total_train = stats["lichess_train"] + stats["lc0_train"]
+    total_test = stats["lichess_test"] + stats["lc0_test"]
+    total_games = total_train + total_test
+    
+    print(f"Done. Total Games: {total_games:,}")
+    print(f"  Train Games: {total_train:,} (Lichess: {stats['lichess_train']:,}, Lc0: {stats['lc0_train']:,})")
+    if args.test_fraction > 0:
+        print(f"  Test Games:  {total_test:,} (Lichess: {stats['lichess_test']:,}, Lc0: {stats['lc0_test']:,})")
+
+    # Count actual shards written
+    num_train_shards = len(list(out_dir.glob('train/*/*.pgn')))
+    num_test_shards = len(list(out_dir.glob('test/*/*.pgn')))
+    total_shards = num_train_shards + num_test_shards
+
+    print(f"Shards written: {total_shards:,} (Train: {num_train_shards:,}, Test: {num_test_shards:,}) in {dt/60:.1f} min")
+    if dt > 0 and total_games > 0:
+        print(f"Processing speed ≈ {total_games/dt:,.0f} games/s")
 
 
 if __name__ == "__main__":

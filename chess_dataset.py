@@ -249,6 +249,11 @@ def fast_chess_collate_fn(sample_list):
             np_dict['original_indices_in_file'] = np.concatenate([d['original_indices_in_file'] for d in sample_list], axis=0)
 
     out: Dict[str, torch.Tensor] = {}
+    
+    # Check if we're in a worker process
+    worker_info = get_worker_info()
+    in_worker_process = worker_info is not None
+    
     for key, arr in np_dict.items():
         if key == 'source_file_basename':
             out[key] = arr
@@ -280,8 +285,18 @@ def fast_chess_collate_fn(sample_list):
         elif key == "ply_target":
             t = t.short()
 
-        if not t.is_pinned():
-            t = t.pin_memory()
+        # Only pin memory if not in worker process and tensor is not already pinned
+        if not in_worker_process and not t.is_pinned():
+            try:
+                t = t.pin_memory()
+            except RuntimeError as e:
+                # Handle CUDA errors gracefully (e.g., CUDA not available or busy)
+                if "CUDA" in str(e):
+                    # Skip pinning if CUDA is not available or busy
+                    pass
+                else:
+                    # Re-raise if it's a different kind of RuntimeError
+                    raise
 
         out[key] = t
 

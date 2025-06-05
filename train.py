@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque, defaultdict
 from safetensors.torch import save_file
+from tqdm import tqdm
 from losses import (
     ply_loss_fn as _ply_loss_fn,
     new_policy_loss_fn as _new_policy_loss_fn,
@@ -68,11 +69,13 @@ def load_config(path: str) -> dict:
     cfg['dataset']['batch_size'] = int(cfg['dataset']['batch_size'])
     if 'grad_accum' in cfg['dataset'] and cfg['dataset']['grad_accum'] is not None:
         cfg['dataset']['grad_accum'] = int(cfg['dataset']['grad_accum'])
+    else:
+        cfg['dataset']['grad_accum'] = 1
+        print("Warning: 'grad_accum' not found in config under 'dataset'. Defaulting to 1.")
+
     cfg['dataset']['num_workers'] = int(cfg['dataset']['num_workers'])
 
     # Runtime
-    if 'grad_accum' in cfg['runtime'] and cfg['runtime']['grad_accum'] is not None:
-        cfg['runtime']['grad_accum'] = int(cfg['runtime']['grad_accum'])
     cfg['runtime']['max_steps'] = int(cfg['runtime']['max_steps'])
     cfg['runtime']['log_every'] = int(cfg['runtime']['log_every'])
     cfg['runtime']['ckpt_every'] = int(cfg['runtime']['ckpt_every'])
@@ -203,8 +206,16 @@ def evaluate_model(model: ViTChess, device: torch.device,
         infinite=False
     )
 
+    # Calculate total batches for tqdm progress bar
+    total_batches = 0
+    if hasattr(val_loader.dataset, 'total_positions_in_dataset') and val_loader.dataset.total_positions_in_dataset > 0:
+        total_batches = (val_loader.dataset.total_positions_in_dataset + batch_size - 1) // batch_size
+    else:
+        # Fallback if total_positions_in_dataset is not available or 0, progress bar will not show total
+        print("Warning: Could not determine total number of batches for validation progress bar.")
+
     with torch.no_grad():
-        for i, cpu_batch in enumerate(val_loader):
+        for i, cpu_batch in enumerate(tqdm(val_loader, total=total_batches, desc=f"Evaluating {data_source_dir}", unit="batch")):
             batch = move_batch_to_device(cpu_batch, device)
             current_batch_size = batch['bitboards'].size(0)
             total_samples += current_batch_size
@@ -261,9 +272,6 @@ def evaluate_model(model: ViTChess, device: torch.device,
             summed_losses['material'] += loss_material.item() * current_batch_size
             summed_losses['total'] += total_loss.item() * current_batch_size
             summed_losses['compare_lc0'] += compare_lc0.item() * current_batch_size
-            
-            if (i + 1) % 100 == 0:
-                print(f"  Evaluated {total_samples} positions from {data_source_dir}...")
 
     avg_losses = {name: (loss_sum / total_samples if total_samples > 0 else 0)
                   for name, loss_sum in summed_losses.items()}
@@ -330,15 +338,13 @@ def main(config_path: str):
     ds_cfg['tensor_glob_pattern'] = ds_cfg.get('tensor_glob_pattern', '*.npz')
     
     rt = cfg['runtime']
-    rt['grad_accum'] = int(rt['grad_accum'])
     rt['max_steps'] = int(rt['max_steps'])
     rt['log_every'] = int(rt['log_every'])
     rt['ckpt_every'] = int(rt['ckpt_every'])
     rt['gradient_clip_norm'] = float(rt['gradient_clip_norm'])
     rt['gradient_clip_value'] = float(rt.get('gradient_clip_value', 5.0))  # Add value clipping
     rt['val_every'] = int(rt.get('val_every', 20000))
-    rt['test_data_dir'] = str(rt.get('test_data_dir', 'test'))
-    
+
     model_cfg_types = cfg['model']
     model_cfg_types['dim'] = int(model_cfg_types['dim'])
     model_cfg_types['depth'] = int(model_cfg_types['depth'])
@@ -484,11 +490,11 @@ def main(config_path: str):
 
     # Training loop
     step = 0
-    grad_accum = rt['grad_accum']
+    grad_accum = ds_cfg['grad_accum']
     log_every = rt['log_every']
     ckpt_every = rt['ckpt_every']
     val_every = rt['val_every']
-    test_data_dir_from_cfg = rt['test_data_dir']
+    test_data_dir_from_cfg = ds_cfg['test_data_dir'] # Use dataset config for test_data_dir
     freeze_iters = model_cfg_types['freeze_distance_iters']
 
     # Asynchronous GPU prefetch

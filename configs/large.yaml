@@ -12,40 +12,39 @@ model:
   policy_head_conv_dim: 1024
   policy_head_mlp_hidden_dim: 2048
   value_head_mlp_hidden_dim: 1024
-  value_head_dropout_rate: 0.2
+  value_head_dropout_rate: 0.3
   num_policy_planes: 73
   drop_path: 0.1
 
 loss_weights:
   policy:           1.0
-  value:            1.5
-  moves_left:       0.2
+  value:            1.6
+  moves_left:       0.15
   auxiliary_value:  0.2   # early‐group WDL head
   material:         0.1
   contrastive:      0.15  # cosine loss on CLS features
 
 optimiser:
   type:             adamw
-  lr:               2e-4
+  lr:               1.5e-4
   weight_decay:     1e-2
   betas:            [0.9, 0.95]
   sched:            cosine
   warmup_steps:     1500
 
 dataset:
-  data_dir:     data
+  data_dir:     data/train/lc0
+  test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
   batch_size:       128
-  grad_accum:       1
+  grad_accum:       4
   num_workers:      4
   flips:            true
   type:             tensor
   tensor_glob_pattern: '**/*.npz'
-  test_data_dir:    test
 
 runtime:
   device:           cuda
   precision:        fp16
-  grad_accum:       2
   max_steps:        4200000
   log_every:        500
   ckpt_every:       50000

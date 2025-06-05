@@ -4,54 +4,52 @@ model:
   early_depth:           2
   heads:                 6
   distance_matrix_path:  dist_init.npy
-  freeze_distance_iters: 50000
+  freeze_distance_iters: 5000
   pool_every_k_blocks: 3
   cls_dropout_rate: 0.05
   cls_pool_alpha_requires_grad: true
   cls_pool_alpha_init: 1.0
-  policy_head_conv_dim: 192
-  policy_head_mlp_hidden_dim: 192
-  value_head_mlp_hidden_dim: 96
-  value_head_dropout_rate: 0.2
+  policy_head_conv_dim: 384
+  policy_head_mlp_hidden_dim: 384
+  value_head_mlp_hidden_dim: 256
+  value_head_dropout_rate: 0.3
   num_policy_planes: 73
   drop_path: 0.1
 
 loss_weights:
   policy:           1.0
-  value:            1.5
-  moves_left:       0.2
+  value:            1.6
+  moves_left:       0.15
   auxiliary_value:  0.2   # early‐group WDL head
   material:         0.1
-  contrastive:      0.15  # cosine loss on CLS features
 
 optimiser:
   type:             adamw
-  lr:               2e-4
+  lr:               1.5e-4
   weight_decay:     1e-2
   betas:            [0.9, 0.95]
   sched:            cosine
   warmup_steps:     1500
 
 dataset:
-  data_dir:     data
-  batch_size:       128
-  grad_accum:       1
-  num_workers:      4
-  flips:            true
+  data_dir:     data/train/lc0
+  test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
+  batch_size:       1500
+  grad_accum:       3
+  num_workers:      5
   type:             tensor
-  tensor_glob_pattern: '**/*.npz'
-  test_data_dir:    test
+  tensor_glob_pattern: '*.npz'
 
 runtime:
   device:           cuda
   precision:        fp16
-  grad_accum:       2
-  max_steps:        4200000
-  log_every:        500
-  ckpt_every:       50000
-  val_every:        20000
+  max_steps:        2000000
+  log_every:        2000
+  ckpt_every:       100000
+  val_every:        200000
   checkpoint_format: safetensors
-  gradient_clip_norm: 1.0   # global‐norm
+  gradient_clip_norm: 0.5   # global‐norm clipping
+  gradient_clip_value: 5.0  # value clipping for stability
 
 logging:
   output_dir:       ./runs/v1/tiny

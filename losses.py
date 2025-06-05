@@ -32,10 +32,10 @@ def ply_loss_fn(output_ply: torch.Tensor, target_ply: torch.Tensor, scale: float
     processed_output_ply = output_ply.squeeze(-1) if output_ply.ndim > 1 and output_ply.shape[-1] == 1 else output_ply
     processed_target_ply = target_ply.squeeze(-1) if target_ply.ndim > 1 and target_ply.shape[-1] == 1 else target_ply
     # Scale both
-    proc_out = processed_output_ply.float() / scale
-    proc_tgt = processed_target_ply.float() / scale
+    proc_out = processed_output_ply.float() / (2*scale)
+    proc_tgt = processed_target_ply.float() / (2*scale)
     # Delta computed relative to scale
-    delta = 10.0 / scale
+    delta = 10.0 / (2*scale)
     return F.huber_loss(proc_out, proc_tgt, reduction="mean", delta=delta)
 
 def new_policy_loss_fn(target: torch.Tensor, output: torch.Tensor) -> torch.Tensor:

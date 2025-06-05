@@ -9,10 +9,13 @@ model:
   cls_dropout_rate: 0.05
   cls_pool_alpha_requires_grad: true
   cls_pool_alpha_init: 1.0
+  adaptive_pool_temperature: 1.0
   policy_head_conv_dim: 784
   policy_head_mlp_hidden_dim: 784
   value_head_mlp_hidden_dim: 512
   value_head_dropout_rate: 0.3
+  value_cross_attn_summary_dim: 128
+  moves_left_cross_attn_summary_dim: 64
   num_policy_planes: 73
   drop_path: 0.1
 
@@ -22,6 +25,7 @@ loss_weights:
   moves_left:       0.15
   auxiliary_value:  0.2   # early‐group WDL head
   material:         0.1
+  cls_sparsity:     5e-5
 
 optimiser:
   type:             adamw

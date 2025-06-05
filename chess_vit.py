@@ -19,6 +19,68 @@ NUM_BITBOARD_PLANES = 14  # 12 piece planes + castling + en-passant
 # ---------------------------------------------------------------------------
 # Utility layers & helpers
 # ---------------------------------------------------------------------------
+class ValueCrossAttention(nn.Module):
+    """Lightweight cross-attention where CLS queries patches for value-relevant info."""
+    def __init__(self, dim, num_heads=4, summary_dim=None):
+        super().__init__()
+        summary_dim = summary_dim or dim // 2
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.summary_dim = summary_dim
+        
+        # CLS -> Query, Patches -> Key/Value
+        self.q_proj = nn.Linear(dim, dim)
+        self.kv_proj = nn.Linear(dim, dim * 2)
+        self.out_proj = nn.Linear(dim, summary_dim)
+        
+        self.scale = self.head_dim ** -0.5
+        
+    def forward(self, cls_token, patch_tokens):
+        B = cls_token.shape[0]
+        
+        # Project
+        q = self.q_proj(cls_token).view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv_proj(patch_tokens).view(B, -1, 2, self.num_heads, self.head_dim)
+        k, v = kv.unbind(2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        
+        # Aggregate
+        out = (attn @ v).transpose(1, 2).reshape(B, 1, -1)
+        out = self.out_proj(out).squeeze(1)
+        
+        return out
+
+class AdaptivePooling(nn.Module):
+    """Learn importance weights based on CLS state rather than uniform pooling."""
+    def __init__(self, dim, temperature=1.0):
+        super().__init__()
+        # CLS and patches determine what's important to pool
+        self.importance_net = nn.Sequential(
+            nn.Linear(dim * 2, dim // 4),
+            nn.ReLU(),
+            nn.Linear(dim // 4, 1)
+        )
+        self.temperature = temperature
+        
+    def forward(self, cls_token, patch_tokens):
+        # cls_token shape: (B, 1, dim), patch_tokens shape: (B, N, dim)
+        cls_expanded = cls_token.expand_as(patch_tokens)
+        combined = torch.cat([patch_tokens, cls_expanded], dim=-1)
+        
+        # Compute importance scores
+        importance = self.importance_net(combined) / self.temperature
+        weights = F.softmax(importance, dim=1)
+        
+        # Weighted pooling
+        pooled = (patch_tokens * weights).sum(dim=1, keepdim=True)
+        
+        return pooled
+
 class SwiGLU(nn.Module):
     """SwiGLU activation function: x * swish(gate)"""
     def __init__(self, dim: int, hidden: Optional[int] = None, drop: float = 0.0):
@@ -164,6 +226,9 @@ class ViTChess(nn.Module):
         value_head_mlp_hidden_dim: Optional[int] = None,
         value_head_dropout_rate: float = 0.0,
         dim_head: Optional[int] = None,
+        value_cross_attn_summary_dim: Optional[int] = None,
+        moves_left_cross_attn_summary_dim: Optional[int] = None,
+        adaptive_pool_temperature: Optional[float] = None,
     ):
         super().__init__()
         if early_depth >= depth:
@@ -177,6 +242,9 @@ class ViTChess(nn.Module):
         self.policy_cls_projection_dim = policy_cls_projection_dim
         self.pool_every_k_blocks = pool_every_k_blocks
         self.cls_dropout_rate = cls_dropout_rate
+        self.value_cross_attn_summary_dim = value_cross_attn_summary_dim
+        self.moves_left_cross_attn_summary_dim = moves_left_cross_attn_summary_dim
+        self.adaptive_pool_temperature = adaptive_pool_temperature
 
         # Patch + position embedding
         self.patch_embed = nn.Conv2d(NUM_BITBOARD_PLANES, dim, kernel_size=1)
@@ -204,14 +272,26 @@ class ViTChess(nn.Module):
         # CLS Dropout and Pooling Alphas
         self.cls_dropout = nn.Dropout(cls_dropout_rate)
         self.alphas = nn.ParameterList()
+        self.adaptive_pools = nn.ModuleList()
         if self.pool_every_k_blocks is not None:
             num_potential_pools = (self.depth - 1) // self.pool_every_k_blocks
             for _ in range(num_potential_pools):
                 self.alphas.append(
                     nn.Parameter(torch.tensor(cls_pool_alpha_init), requires_grad=cls_pool_alpha_requires_grad)
                 )
+                if self.adaptive_pool_temperature is not None and self.adaptive_pool_temperature > 0:
+                    self.adaptive_pools.append(AdaptivePooling(dim, temperature=self.adaptive_pool_temperature))
 
         # Prediction Heads
+        # Cross-attention layers
+        self.value_cross_attn = None
+        if self.value_cross_attn_summary_dim and self.value_cross_attn_summary_dim > 0:
+            self.value_cross_attn = ValueCrossAttention(dim, num_heads=heads, summary_dim=self.value_cross_attn_summary_dim)
+
+        self.moves_left_cross_attn = None
+        if self.moves_left_cross_attn_summary_dim and self.moves_left_cross_attn_summary_dim > 0:
+            self.moves_left_cross_attn = ValueCrossAttention(dim, num_heads=heads, summary_dim=self.moves_left_cross_attn_summary_dim)
+
         def create_value_head(input_dim: int, hidden_dim: Optional[int], output_dim: int, dropout_rate: float) -> nn.Module:
             if hidden_dim and hidden_dim > 0:
                 layers = [
@@ -228,8 +308,16 @@ class ViTChess(nn.Module):
         # Early and Final Prediction Heads
         self.early_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs, value_head_dropout_rate)
         self.early_material_head = nn.Linear(dim, num_material_categories)
-        self.final_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs, value_head_dropout_rate)
-        self.final_moves_left_head = nn.Linear(dim, num_moves_left_outputs)
+        
+        final_value_input_dim = dim
+        if self.value_cross_attn:
+            final_value_input_dim += self.value_cross_attn_summary_dim
+        self.final_value_head = create_value_head(final_value_input_dim, value_head_mlp_hidden_dim, num_value_outputs, value_head_dropout_rate)
+
+        final_moves_left_input_dim = dim
+        if self.moves_left_cross_attn:
+            final_moves_left_input_dim += self.moves_left_cross_attn_summary_dim
+        self.final_moves_left_head = nn.Linear(final_moves_left_input_dim, num_moves_left_outputs)
 
         # Policy Head Architecture
         self.policy_conv1 = nn.Conv2d(dim, policy_head_conv_dim, kernel_size=3, padding=1)
@@ -308,11 +396,17 @@ class ViTChess(nn.Module):
                d < self.depth - 1:
                 
                 cls_from_block, patches_from_block = x[:, :1], x[:, 1:]
-                mean_pooled_patches = torch.mean(patches_from_block, dim=1, keepdim=True)
+
+                # Use adaptive pooling if available, otherwise mean pool
+                if self.adaptive_pools and alpha_idx_counter < len(self.adaptive_pools):
+                    pooled_patches = self.adaptive_pools[alpha_idx_counter](cls_from_block, patches_from_block)
+                else:
+                    pooled_patches = torch.mean(patches_from_block, dim=1, keepdim=True)
+                
                 current_alpha = self.alphas[alpha_idx_counter]
                 alpha_idx_counter += 1
                 
-                cls_updated_by_pool = cls_from_block + current_alpha * mean_pooled_patches
+                cls_updated_by_pool = cls_from_block + current_alpha * pooled_patches
                 x = torch.cat([cls_updated_by_pool, patches_from_block], dim=1)
 
         # Final layer norm and final heads
@@ -320,8 +414,21 @@ class ViTChess(nn.Module):
         cls_final_features = self.cls_dropout(x_norm_final[:, 0])
         patch_final_features = x_norm_final[:, 1:]
 
-        outputs["final_value"] = self.final_value_head(cls_final_features)
-        outputs["final_moves_left"] = self.final_moves_left_head(cls_final_features)
+        outputs["final_cls_features"] = cls_final_features
+
+        # Value Head
+        value_head_input = cls_final_features
+        if self.value_cross_attn is not None:
+            spatial_summary_value = self.value_cross_attn(cls_final_features.unsqueeze(1), patch_final_features)
+            value_head_input = torch.cat([cls_final_features, spatial_summary_value], dim=-1)
+        outputs["final_value"] = self.final_value_head(value_head_input)
+
+        # Moves Left Head
+        moves_left_head_input = cls_final_features
+        if self.moves_left_cross_attn is not None:
+            spatial_summary_moves = self.moves_left_cross_attn(cls_final_features.unsqueeze(1), patch_final_features)
+            moves_left_head_input = torch.cat([cls_final_features, spatial_summary_moves], dim=-1)
+        outputs["final_moves_left"] = self.final_moves_left_head(moves_left_head_input)
 
         # Policy Head
         policy_input_spatial = patch_final_features.transpose(1, 2).reshape(
@@ -429,7 +536,10 @@ def load_model_from_checkpoint(
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
         value_head_mlp_hidden_dim=cfg['model'].get('value_head_mlp_hidden_dim'),
         value_head_dropout_rate=cfg['model'].get('value_head_dropout_rate', 0.0),
-        dim_head=cfg['model'].get('dim_head')
+        dim_head=cfg['model'].get('dim_head'),
+        value_cross_attn_summary_dim=cfg['model'].get('value_cross_attn_summary_dim'),
+        moves_left_cross_attn_summary_dim=cfg['model'].get('moves_left_cross_attn_summary_dim'),
+        adaptive_pool_temperature=cfg['model'].get('adaptive_pool_temperature')
     )
     model.to(device)
 

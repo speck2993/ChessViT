@@ -58,6 +58,12 @@ def load_config(path: str) -> dict:
         cfg['model']['policy_head_mlp_hidden_dim'] = int(cfg['model']['policy_head_mlp_hidden_dim'])
     if 'value_head_mlp_hidden_dim' in cfg['model'] and cfg['model']['value_head_mlp_hidden_dim'] is not None:
         cfg['model']['value_head_mlp_hidden_dim'] = int(cfg['model']['value_head_mlp_hidden_dim'])
+    if 'value_cross_attn_summary_dim' in cfg['model'] and cfg['model']['value_cross_attn_summary_dim'] is not None:
+        cfg['model']['value_cross_attn_summary_dim'] = int(cfg['model']['value_cross_attn_summary_dim'])
+    if 'moves_left_cross_attn_summary_dim' in cfg['model'] and cfg['model']['moves_left_cross_attn_summary_dim'] is not None:
+        cfg['model']['moves_left_cross_attn_summary_dim'] = int(cfg['model']['moves_left_cross_attn_summary_dim'])
+    if 'adaptive_pool_temperature' in cfg['model'] and cfg['model']['adaptive_pool_temperature'] is not None:
+        cfg['model']['adaptive_pool_temperature'] = float(cfg['model']['adaptive_pool_temperature'])
 
     # Optimiser
     cfg['optimiser']['lr'] = float(cfg['optimiser']['lr'])
@@ -87,6 +93,9 @@ def load_config(path: str) -> dict:
         cfg['runtime']['gradient_clip_value'] = float(cfg['runtime']['gradient_clip_value'])
         
     # Loss weights
+    if 'loss_weights' not in cfg:
+        cfg['loss_weights'] = {}
+    cfg['loss_weights']['cls_sparsity'] = cfg['loss_weights'].get('cls_sparsity', 1e-4) # Add default
     for k in cfg['loss_weights']:
         cfg['loss_weights'][k] = float(cfg['loss_weights'][k])
 
@@ -254,6 +263,9 @@ def evaluate_model(model: ViTChess, device: torch.device,
             loss_moves = _ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
             loss_aux = F.cross_entropy(outputs['early_value'], batch['value_target'])
             loss_material = F.cross_entropy(outputs['early_material'], batch['material_category'])
+            loss_cls_sparsity = torch.tensor(0.0, device=device)
+            if 'final_cls_features' in outputs:
+                loss_cls_sparsity = outputs['final_cls_features'].abs().mean()
 
             lw = loss_weights_cfg
             total_loss = (
@@ -261,7 +273,8 @@ def evaluate_model(model: ViTChess, device: torch.device,
                 lw['value'] * loss_value +
                 lw['moves_left'] * loss_moves +
                 lw['auxiliary_value'] * loss_aux +
-                lw['material'] * loss_material
+                lw['material'] * loss_material +
+                lw['cls_sparsity'] * loss_cls_sparsity
             )
             compare_lc0 = loss_policy + 1.6 * loss_value + 0.5 * loss_moves
 
@@ -270,6 +283,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
             summed_losses['moves_left'] += loss_moves.item() * current_batch_size
             summed_losses['auxiliary_value'] += loss_aux.item() * current_batch_size
             summed_losses['material'] += loss_material.item() * current_batch_size
+            summed_losses['cls_sparsity'] += loss_cls_sparsity.item() * current_batch_size
             summed_losses['total'] += total_loss.item() * current_batch_size
             summed_losses['compare_lc0'] += compare_lc0.item() * current_batch_size
 
@@ -411,7 +425,10 @@ def main(config_path: str):
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
         value_head_mlp_hidden_dim=cfg['model'].get('value_head_mlp_hidden_dim', 256),
         value_head_dropout_rate=cfg['model'].get('value_head_dropout_rate', 0.0),
-        dim_head=cfg['model'].get('dim_head', 64)
+        dim_head=cfg['model'].get('dim_head', 64),
+        value_cross_attn_summary_dim=cfg['model'].get('value_cross_attn_summary_dim'),
+        moves_left_cross_attn_summary_dim=cfg['model'].get('moves_left_cross_attn_summary_dim'),
+        adaptive_pool_temperature=cfg['model'].get('adaptive_pool_temperature')
     )
         
     model.to(device)
@@ -476,7 +493,7 @@ def main(config_path: str):
     # Rolling metrics (simplified without contrastive components)
     rm = cfg.get('rolling_metrics', {})
     window = rm.get('window_size', 1000)
-    metric_names = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 'total', 'compare_lc0']
+    metric_names = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 'total', 'compare_lc0', 'cls_sparsity']
     metrics = {name: deque(maxlen=window) for name in metric_names}
 
     # Throughput tracking
@@ -576,7 +593,10 @@ def main(config_path: str):
                 loss_moves = _ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
                 loss_aux = F.cross_entropy(outputs['early_value'], batch['value_target'])
                 loss_material = F.cross_entropy(outputs['early_material'], batch['material_category'])
-                
+                loss_cls_sparsity = torch.tensor(0.0, device=device)
+                if 'final_cls_features' in outputs:
+                    loss_cls_sparsity = outputs['final_cls_features'].abs().mean()
+
                 # Weighted total (simplified without contrastive)
                 lw = cfg['loss_weights']
                 total_loss = (
@@ -585,6 +605,7 @@ def main(config_path: str):
                     + lw['moves_left'] * loss_moves
                     + lw['auxiliary_value'] * loss_aux
                     + lw['material'] * loss_material
+                    + lw['cls_sparsity'] * loss_cls_sparsity
                 )
                 compare_lc0 = (
                     loss_policy
@@ -620,6 +641,7 @@ def main(config_path: str):
             metrics['moves_left'].append(loss_moves.item())
             metrics['auxiliary_value'].append(loss_aux.item())
             metrics['material'].append(loss_material.item())
+            metrics['cls_sparsity'].append(loss_cls_sparsity.item())
             metrics['total'].append(total_loss.item())
             metrics['compare_lc0'].append(compare_lc0.item())
 
@@ -649,7 +671,23 @@ def main(config_path: str):
                 elapsed = current_time - last_log_time
                 throughput = positions / elapsed if elapsed > 0 else float('inf')
                 
-                print(f"[Step {step+1}/{rt['max_steps']}] total_loss: {mean_metrics['total']:.4f}, lc0_loss: {mean_metrics['compare_lc0']:.4f}, policy: {mean_metrics['policy']:.4f}, value: {mean_metrics['value']:.4f}, moves_left: {mean_metrics['moves_left']:.4f}, auxiliary_value: {mean_metrics['auxiliary_value']:.4f}, material: {mean_metrics['material']:.4f}, {throughput:.1f} positions/sec, data_load_time: {mean_data_loading_time:.4f}s{alpha_log_str}", flush=True)
+                log_str_parts = [
+                    f"[Step {step+1}/{rt['max_steps']}]",
+                    f"total_loss: {mean_metrics['total']:.4f}",
+                    f"lc0_loss: {mean_metrics['compare_lc0']:.4f}",
+                    f"policy: {mean_metrics['policy']:.4f}",
+                    f"value: {mean_metrics['value']:.4f}",
+                    f"moves_left: {mean_metrics['moves_left']:.4f}",
+                    f"aux_val: {mean_metrics['auxiliary_value']:.4f}",
+                    f"material: {mean_metrics['material']:.4f}",
+                    f"cls_sparsity: {mean_metrics['cls_sparsity']:.4f}",
+                    f"{throughput:.1f} pos/s",
+                    f"data_load: {mean_data_loading_time:.4f}s"
+                ]
+                if alpha_log_str:
+                    log_str_parts.append(alpha_log_str.strip(', '))
+
+                print(", ".join(log_str_parts), flush=True)
                 
                 last_log_time = current_time
                 last_log_step = step + 1

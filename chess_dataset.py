@@ -203,11 +203,12 @@ class ChunkMmapDataset(IterableDataset):
     def _yield_batches_from(self, path: Path):
         with np.load(path, mmap_mode="r", allow_pickle=False) as npz:
             keys = npz.files
+            if not keys:
+                return
             n = npz[keys[0]].shape[0]
             for start in range(0, n, self.batch_size):
-                end = start + self.batch_size
-                if end > n:
-                    break  # keep static shapes
+                end = min(start + self.batch_size, n)
+                # Yield batch, even if it's partial. This ensures all data is seen.
                 batch_data = {k: npz[k][start:end] for k in keys}
                 batch_data['source_file_basename'] = path.name
                 batch_data['original_indices_in_file'] = np.arange(start, end, dtype=np.int64)

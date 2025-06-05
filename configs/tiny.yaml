@@ -9,10 +9,13 @@ model:
   cls_dropout_rate: 0.05
   cls_pool_alpha_requires_grad: true
   cls_pool_alpha_init: 1.0
+  adaptive_pool_temperature: 1.0
   policy_head_conv_dim: 384
   policy_head_mlp_hidden_dim: 384
   value_head_mlp_hidden_dim: 256
   value_head_dropout_rate: 0.3
+  value_cross_attn_summary_dim: 48
+  moves_left_cross_attn_summary_dim: 24
   num_policy_planes: 73
   drop_path: 0.1
 
@@ -22,6 +25,7 @@ loss_weights:
   moves_left:       0.15
   auxiliary_value:  0.2   # early‐group WDL head
   material:         0.1
+  cls_sparsity:     5e-5
 
 optimiser:
   type:             adamw
@@ -34,8 +38,8 @@ optimiser:
 dataset:
   data_dir:     data/train/lc0
   test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
-  batch_size:       1500
-  grad_accum:       3
+  batch_size:       1536
+  grad_accum:       4
   num_workers:      5
   type:             tensor
   tensor_glob_pattern: '*.npz'
@@ -43,10 +47,10 @@ dataset:
 runtime:
   device:           cuda
   precision:        fp16
-  max_steps:        2000000
-  log_every:        2000
-  ckpt_every:       100000
-  val_every:        200000
+  max_steps:        2250000
+  log_every:        5000
+  ckpt_every:       150000
+  val_every:        75000
   checkpoint_format: safetensors
   gradient_clip_norm: 0.5   # global‐norm clipping
   gradient_clip_value: 5.0  # value clipping for stability

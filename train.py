@@ -46,8 +46,7 @@ def load_config(path: str) -> dict:
     cfg['model']['depth'] = int(cfg['model']['depth'])
     cfg['model']['early_depth'] = int(cfg['model']['early_depth'])
     cfg['model']['heads'] = int(cfg['model']['heads'])
-    if 'freeze_distance_iters' in cfg['model'] and cfg['model']['freeze_distance_iters'] is not None:
-        cfg['model']['freeze_distance_iters'] = int(cfg['model']['freeze_distance_iters'])
+
     if 'pool_every_k_blocks' in cfg['model'] and cfg['model']['pool_every_k_blocks'] is not None:
         cfg['model']['pool_every_k_blocks'] = int(cfg['model']['pool_every_k_blocks'])
     if 'cls_dropout_rate' in cfg['model'] and cfg['model']['cls_dropout_rate'] is not None:
@@ -56,14 +55,38 @@ def load_config(path: str) -> dict:
         cfg['model']['policy_head_conv_dim'] = int(cfg['model']['policy_head_conv_dim'])
     if 'policy_head_mlp_hidden_dim' in cfg['model'] and cfg['model']['policy_head_mlp_hidden_dim'] is not None:
         cfg['model']['policy_head_mlp_hidden_dim'] = int(cfg['model']['policy_head_mlp_hidden_dim'])
-    if 'value_head_mlp_hidden_dim' in cfg['model'] and cfg['model']['value_head_mlp_hidden_dim'] is not None:
-        cfg['model']['value_head_mlp_hidden_dim'] = int(cfg['model']['value_head_mlp_hidden_dim'])
     if 'value_cross_attn_summary_dim' in cfg['model'] and cfg['model']['value_cross_attn_summary_dim'] is not None:
         cfg['model']['value_cross_attn_summary_dim'] = int(cfg['model']['value_cross_attn_summary_dim'])
     if 'moves_left_cross_attn_summary_dim' in cfg['model'] and cfg['model']['moves_left_cross_attn_summary_dim'] is not None:
         cfg['model']['moves_left_cross_attn_summary_dim'] = int(cfg['model']['moves_left_cross_attn_summary_dim'])
     if 'adaptive_pool_temperature' in cfg['model'] and cfg['model']['adaptive_pool_temperature'] is not None:
         cfg['model']['adaptive_pool_temperature'] = float(cfg['model']['adaptive_pool_temperature'])
+
+    # SmolGen parameters
+    if 'smolgen_start_layer' in cfg['model']:
+        cfg['model']['smolgen_start_layer'] = int(cfg['model']['smolgen_start_layer'])
+    if 'smolgen_latent_dim' in cfg['model']:
+        cfg['model']['smolgen_latent_dim'] = int(cfg['model']['smolgen_latent_dim'])
+    if 'smolgen_dropout' in cfg['model']:
+        cfg['model']['smolgen_dropout'] = float(cfg['model']['smolgen_dropout'])
+
+    # Value head parameters
+    if 'value_spatial_compress_dim' in cfg['model']:
+        cfg['model']['value_spatial_compress_dim'] = int(cfg['model']['value_spatial_compress_dim'])
+    if 'value_head_mlp_dims' in cfg['model'] and cfg['model']['value_head_mlp_dims'] is not None:
+        cfg['model']['value_head_mlp_dims'] = [int(d) for d in cfg['model']['value_head_mlp_dims']]
+    if 'moves_left_spatial_compress_dim' in cfg['model']:
+        cfg['model']['moves_left_spatial_compress_dim'] = int(cfg['model']['moves_left_spatial_compress_dim'])
+    if 'moves_left_head_mlp_dims' in cfg['model'] and cfg['model']['moves_left_head_mlp_dims'] is not None:
+        cfg['model']['moves_left_head_mlp_dims'] = [int(d) for d in cfg['model']['moves_left_head_mlp_dims']]
+
+    # Hybrid patch embedding parameters
+    if 'patch_resblock_hidden' in cfg['model']:
+        cfg['model']['patch_resblock_hidden'] = int(cfg['model']['patch_resblock_hidden'])
+    if 'patch_global_proj_dim' in cfg['model']:
+        cfg['model']['patch_global_proj_dim'] = int(cfg['model']['patch_global_proj_dim'])
+    if 'patch_embed_dropout' in cfg['model']:
+        cfg['model']['patch_embed_dropout'] = float(cfg['model']['patch_embed_dropout'])
 
     # Optimiser
     cfg['optimiser']['lr'] = float(cfg['optimiser']['lr'])
@@ -95,7 +118,6 @@ def load_config(path: str) -> dict:
     # Loss weights
     if 'loss_weights' not in cfg:
         cfg['loss_weights'] = {}
-    cfg['loss_weights']['cls_sparsity'] = cfg['loss_weights'].get('cls_sparsity', 1e-4) # Add default
     for k in cfg['loss_weights']:
         cfg['loss_weights'][k] = float(cfg['loss_weights'][k])
 
@@ -273,8 +295,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
                 lw['value'] * loss_value +
                 lw['moves_left'] * loss_moves +
                 lw['auxiliary_value'] * loss_aux +
-                lw['material'] * loss_material +
-                lw['cls_sparsity'] * loss_cls_sparsity
+                lw['material'] * loss_material
             )
             compare_lc0 = loss_policy + 1.6 * loss_value + 0.5 * loss_moves
 
@@ -283,7 +304,6 @@ def evaluate_model(model: ViTChess, device: torch.device,
             summed_losses['moves_left'] += loss_moves.item() * current_batch_size
             summed_losses['auxiliary_value'] += loss_aux.item() * current_batch_size
             summed_losses['material'] += loss_material.item() * current_batch_size
-            summed_losses['cls_sparsity'] += loss_cls_sparsity.item() * current_batch_size
             summed_losses['total'] += total_loss.item() * current_batch_size
             summed_losses['compare_lc0'] += compare_lc0.item() * current_batch_size
 
@@ -364,7 +384,7 @@ def main(config_path: str):
     model_cfg_types['depth'] = int(model_cfg_types['depth'])
     model_cfg_types['early_depth'] = int(model_cfg_types['early_depth'])
     model_cfg_types['heads'] = int(model_cfg_types['heads'])
-    model_cfg_types['freeze_distance_iters'] = int(model_cfg_types['freeze_distance_iters'])
+
     pool_every_k_config_val = model_cfg_types.get('pool_every_k_blocks')
     if pool_every_k_config_val is not None:
         model_cfg_types['pool_every_k_blocks'] = int(pool_every_k_config_val)
@@ -376,7 +396,6 @@ def main(config_path: str):
     model_cfg_types['policy_head_conv_dim'] = int(model_cfg_types.get('policy_head_conv_dim', 128))
     model_cfg_types['policy_head_mlp_hidden_dim'] = int(model_cfg_types.get('policy_head_mlp_hidden_dim', 256))
     model_cfg_types['drop_path'] = float(model_cfg_types.get('drop_path', 0.1))
-    model_cfg_types['value_head_mlp_hidden_dim'] = int(model_cfg_types.get('value_head_mlp_hidden_dim', 256))
     model_cfg_types['value_head_dropout_rate'] = float(model_cfg_types.get('value_head_dropout_rate', 0.0))
     model_cfg_types['dim_head'] = int(model_cfg_types.get('dim_head', 64))
 
@@ -396,11 +415,6 @@ def main(config_path: str):
 
     seed_everything(cfg.get('seed', 42))
 
-    # Load distance matrix
-    dist_path = cfg['model']['distance_matrix_path']
-    distance_matrix_numpy = np.load(dist_path)
-    distance_matrix = torch.from_numpy(distance_matrix_numpy).float()
-
     # Build model (simplified without contrastive components)
     logging.info("Creating model...")
     model = ViTChess(
@@ -409,8 +423,6 @@ def main(config_path: str):
         early_depth=cfg['model']['early_depth'],
         heads=cfg['model']['heads'],
         drop_path=cfg['model'].get('drop_path', 0.1), 
-        distance_matrix=distance_matrix,
-        freeze_distance=True, 
         num_policy_planes=cfg['model'].get('num_policy_planes', 73),
         num_value_outputs=cfg['model'].get('num_value_outputs', 3),
         num_material_categories=cfg['model'].get('num_material_categories', 20),
@@ -423,16 +435,31 @@ def main(config_path: str):
         cls_dropout_rate=cfg['model'].get('cls_dropout_rate', 0.0),
         policy_head_conv_dim=cfg['model'].get('policy_head_conv_dim', 128),
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
-        value_head_mlp_hidden_dim=cfg['model'].get('value_head_mlp_hidden_dim', 256),
         value_head_dropout_rate=cfg['model'].get('value_head_dropout_rate', 0.0),
         dim_head=cfg['model'].get('dim_head', 64),
-        value_cross_attn_summary_dim=cfg['model'].get('value_cross_attn_summary_dim'),
-        moves_left_cross_attn_summary_dim=cfg['model'].get('moves_left_cross_attn_summary_dim'),
-        adaptive_pool_temperature=cfg['model'].get('adaptive_pool_temperature')
+        adaptive_pool_temperature=cfg['model'].get('adaptive_pool_temperature'),
+        # SmolGen parameters
+        smolgen_start_layer=cfg['model'].get('smolgen_start_layer', 2),
+        smolgen_latent_dim=cfg['model'].get('smolgen_latent_dim', 256),
+        smolgen_dropout=cfg['model'].get('smolgen_dropout', 0.1),
+        # Value head parameters
+        value_spatial_compress_dim=cfg['model'].get('value_spatial_compress_dim', 16),
+        value_head_mlp_dims=cfg['model'].get('value_head_mlp_dims', [256]),
+        moves_left_spatial_compress_dim=cfg['model'].get('moves_left_spatial_compress_dim', 8),
+        moves_left_head_mlp_dims=cfg['model'].get('moves_left_head_mlp_dims', [128]),
+        # Hybrid patch embedding parameters
+        patch_resblock_hidden=cfg['model'].get('patch_resblock_hidden', 32),
+        patch_global_proj_dim=cfg['model'].get('patch_global_proj_dim', 16),
+        patch_embed_dropout=cfg['model'].get('patch_embed_dropout', 0.1),
     )
         
     model.to(device)
     logging.info(f"Model placed on device: {device}")
+
+    # Print model parameter count
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: Total={total_params/1e6:.2f}M, Trainable={trainable_params/1e6:.2f}M")
 
     # Mixed Precision Scaler
     use_amp = cfg['runtime']['precision'] == 'fp16'
@@ -493,7 +520,7 @@ def main(config_path: str):
     # Rolling metrics (simplified without contrastive components)
     rm = cfg.get('rolling_metrics', {})
     window = rm.get('window_size', 1000)
-    metric_names = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 'total', 'compare_lc0', 'cls_sparsity']
+    metric_names = ['policy', 'value', 'moves_left', 'auxiliary_value', 'material', 'total', 'compare_lc0']
     metrics = {name: deque(maxlen=window) for name in metric_names}
 
     # Throughput tracking
@@ -512,7 +539,7 @@ def main(config_path: str):
     ckpt_every = rt['ckpt_every']
     val_every = rt['val_every']
     test_data_dir_from_cfg = ds_cfg['test_data_dir'] # Use dataset config for test_data_dir
-    freeze_iters = model_cfg_types['freeze_distance_iters']
+
 
     # Asynchronous GPU prefetch
     if device.type == "cuda":
@@ -535,8 +562,6 @@ def main(config_path: str):
     try:
         while step < rt['max_steps']:
             model.train()
-            if step == freeze_iters:
-                model.freeze_distance_bias(False)
             if step % grad_accum == 0:
                 optimizer.zero_grad(set_to_none=True)
 
@@ -605,7 +630,6 @@ def main(config_path: str):
                     + lw['moves_left'] * loss_moves
                     + lw['auxiliary_value'] * loss_aux
                     + lw['material'] * loss_material
-                    + lw['cls_sparsity'] * loss_cls_sparsity
                 )
                 compare_lc0 = (
                     loss_policy
@@ -641,7 +665,6 @@ def main(config_path: str):
             metrics['moves_left'].append(loss_moves.item())
             metrics['auxiliary_value'].append(loss_aux.item())
             metrics['material'].append(loss_material.item())
-            metrics['cls_sparsity'].append(loss_cls_sparsity.item())
             metrics['total'].append(total_loss.item())
             metrics['compare_lc0'].append(compare_lc0.item())
 
@@ -680,7 +703,6 @@ def main(config_path: str):
                     f"moves_left: {mean_metrics['moves_left']:.4f}",
                     f"aux_val: {mean_metrics['auxiliary_value']:.4f}",
                     f"material: {mean_metrics['material']:.4f}",
-                    f"cls_sparsity: {mean_metrics['cls_sparsity']:.4f}",
                     f"{throughput:.1f} pos/s",
                     f"data_load: {mean_data_loading_time:.4f}s"
                 ]
@@ -725,6 +747,8 @@ def main(config_path: str):
                 if original_model_training_state:
                     model.train()
                 print(f"--- Finished Validation at Step {step+1} ---\n")
+
+                torch.cuda.empty_cache()
 
             # Checkpoint
             if (step + 1) % ckpt_every == 0:

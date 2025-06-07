@@ -302,6 +302,7 @@ def fast_chess_collate_fn(sample_list):
         out[key] = t
 
     del np_dict
+    gc.collect()
     return out
 
 

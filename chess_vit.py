@@ -19,41 +19,122 @@ NUM_BITBOARD_PLANES = 14  # 12 piece planes + castling + en-passant
 # ---------------------------------------------------------------------------
 # Utility layers & helpers
 # ---------------------------------------------------------------------------
-class ValueCrossAttention(nn.Module):
-    """Lightweight cross-attention where CLS queries patches for value-relevant info."""
-    def __init__(self, dim, num_heads=4, summary_dim=None):
+
+class HybridPatchEmbed(nn.Module):
+    """Combines local ResBlock processing with global per-square projections."""
+    
+    def __init__(
+        self, 
+        in_channels: int = 14,
+        resblock_hidden: int = 32,
+        global_proj_dim: int = 16,  # Per-square global features
+        out_dim: int = 768,
+        dropout: float = 0.1
+    ):
         super().__init__()
-        summary_dim = summary_dim or dim // 2
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.summary_dim = summary_dim
         
-        # CLS -> Query, Patches -> Key/Value
-        self.q_proj = nn.Linear(dim, dim)
-        self.kv_proj = nn.Linear(dim, dim * 2)
-        self.out_proj = nn.Linear(dim, summary_dim)
+        # Store dimensions
+        self.resblock_hidden = resblock_hidden
+        self.global_proj_dim = global_proj_dim
+        self.out_dim = out_dim
         
-        self.scale = self.head_dim ** -0.5
+        # ========== Local Processing Path ==========
+        # ResBlock for local pattern detection
+        self.resblock = nn.Sequential(
+            nn.Conv2d(in_channels, resblock_hidden, kernel_size=3, padding=1),
+            nn.BatchNorm2d(resblock_hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(resblock_hidden, resblock_hidden, kernel_size=3, padding=1),
+            nn.BatchNorm2d(resblock_hidden),
+        )
+        self.resblock_proj = nn.Conv2d(in_channels, resblock_hidden, kernel_size=1)  # Skip connection
         
-    def forward(self, cls_token, patch_tokens):
-        B = cls_token.shape[0]
+        # ========== Global Processing Path ==========
+        # Per-square projections that see the entire board
+        # Using 13 dims: 12 piece types + 1 empty
+        self.square_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(13, global_proj_dim),
+                nn.LayerNorm(global_proj_dim),
+                nn.ReLU(inplace=True)
+            ) for _ in range(64)
+        ])
         
-        # Project
-        q = self.q_proj(cls_token).view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(patch_tokens).view(B, -1, 2, self.num_heads, self.head_dim)
-        k, v = kv.unbind(2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # ========== Fusion ==========
+        # Combine local (resblock_hidden) + global (global_proj_dim) features
+        fusion_dim = resblock_hidden + global_proj_dim
         
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        # Initial projection to model dimension
+        self.initial_proj = nn.Conv2d(fusion_dim, out_dim, kernel_size=1)
         
-        # Aggregate
-        out = (attn @ v).transpose(1, 2).reshape(B, 1, -1)
-        out = self.out_proj(out).squeeze(1)
+        # FFN to process the enriched embedding
+        self.post_embed_ffn = nn.Sequential(
+            nn.Linear(out_dim, out_dim * 2),
+            nn.LayerNorm(out_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim * 2, out_dim),
+            nn.LayerNorm(out_dim)
+        )
         
-        return out
+        # Initialize carefully
+        self._init_weights()
+        
+    def _init_weights(self):
+        # Initialize global projections to start near zero
+        for proj in self.square_projections:
+            nn.init.normal_(proj[0].weight, std=0.02)
+            nn.init.zeros_(proj[0].bias)
+        
+        # Standard initialization for other components
+        nn.init.xavier_uniform_(self.initial_proj.weight)
+        if self.initial_proj.bias is not None:
+            nn.init.zeros_(self.initial_proj.bias)
+        
+    def forward(self, bitboards: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            bitboards: (B, 14, 8, 8) - Standard chess bitboard representation
+        Returns:
+            tokens: (B, 64, out_dim) - Enriched token embeddings
+        """
+        B = bitboards.shape[0]
+        
+        # ========== Local Processing ==========
+        # ResBlock for local pattern detection
+        local_features = self.resblock(bitboards) + self.resblock_proj(bitboards)  # (B, resblock_hidden, 8, 8)
+        local_features = F.relu(local_features)
+        
+        # ========== Global Processing ==========
+        # Create one-hot piece representation for global projections
+        pieces = bitboards[:, :12]  # First 12 channels are pieces
+        empty = 1 - pieces.sum(dim=1, keepdim=True).clamp(0, 1)  # Empty squares
+        
+        piece_one_hot = torch.cat([pieces, empty], dim=1)  # (B, 13, 8, 8)
+        piece_one_hot_flat = piece_one_hot.permute(0, 2, 3, 1).reshape(B, 64, 13)  # (B, 64, 13)
+        
+        # Apply per-square projections
+        global_features_list = []
+        for sq_idx in range(64):
+            # Each square sees the full board state and projects it
+            sq_features = self.square_projections[sq_idx](piece_one_hot_flat[:, sq_idx])  # (B, global_proj_dim)
+            global_features_list.append(sq_features)
+        
+        global_features = torch.stack(global_features_list, dim=1)  # (B, 64, global_proj_dim)
+        global_features = global_features.permute(0, 2, 1).reshape(B, -1, 8, 8)  # (B, global_proj_dim, 8, 8)
+        
+        # ========== Fusion ==========
+        # Concatenate local and global features
+        combined = torch.cat([local_features, global_features], dim=1)  # (B, fusion_dim, 8, 8)
+        
+        # Project to model dimension
+        tokens = self.initial_proj(combined)  # (B, out_dim, 8, 8)
+        tokens = tokens.flatten(2).transpose(1, 2)  # (B, 64, out_dim)
+        
+        # Apply FFN to process enriched embeddings
+        tokens = tokens + self.post_embed_ffn(tokens)  # Residual connection
+        
+        return tokens
 
 class AdaptivePooling(nn.Module):
     """Learn importance weights based on CLS state rather than uniform pooling."""
@@ -101,16 +182,47 @@ class SwiGLU(nn.Module):
         x = self.drop(x)
         return x
 
-class MultiHeadSelfAttention(nn.Module):
-    """MHSA with QK normalization and optional distance bias.
+class SmolGenCLS(nn.Module):
+    """SmolGen: Generate dynamic per-head attention biases from CLS token."""
+    def __init__(self, dim: int, num_heads: int, latent_dim: int = 256, dropout_rate: float = 0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.latent_dim = latent_dim
+        
+        # CLS → per-head latent with extra hidden layer for complex patterns
+        self.cls_to_latent = nn.Sequential(
+            nn.Linear(dim, latent_dim * 2, bias=False),
+            nn.LayerNorm(latent_dim * 2),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(latent_dim * 2, latent_dim * num_heads, bias=False),
+            nn.LayerNorm(latent_dim * num_heads),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Direct mapping to bias (simplified, no low-rank factorization)
+        self.to_bias = nn.Linear(latent_dim, 65 * 65, bias=False)
+        
+        # Initialize to near-zero for stable training
+        nn.init.normal_(self.cls_to_latent[0].weight, std=0.02)
+        nn.init.normal_(self.cls_to_latent[4].weight, std=0.02)
+        nn.init.zeros_(self.to_bias.weight)
+        
+    def forward(self, cls_token: torch.Tensor) -> torch.Tensor:
+        B = cls_token.shape[0]
+        
+        # Get per-head latents
+        latents = self.cls_to_latent(cls_token)  # (B, latent_dim * num_heads)
+        latents = latents.view(B, self.num_heads, self.latent_dim)  # (B, heads, latent_dim)
+        
+        # Generate biases directly
+        biases = self.to_bias(latents)  # (B, heads, 4225)
+        
+        return biases.view(B, self.num_heads, 65, 65)
 
-    Args:
-        bias (torch.Tensor | None): 65×65 distance matrix. Registered as a
-            *parameter* so it can be frozen / unfrozen via .requires_grad_.
-            For per-head bias, this initial bias will be repeated for each head.
-        bias_scale (float): Scalar scale that is *always* trainable.
-    """
-    def __init__(self, dim: int, heads: int, bias: Optional[torch.Tensor] = None):
+class MultiHeadSelfAttention(nn.Module):
+    """MHSA with QK normalization and SmolGen dynamic biasing."""
+    def __init__(self, dim: int, heads: int, use_smolgen: bool = True, smolgen_latent_dim: int = 256, smolgen_dropout: float = 0.1):
         super().__init__()
         if dim % heads:
             raise ValueError("dim must be divisible by heads")
@@ -125,17 +237,14 @@ class MultiHeadSelfAttention(nn.Module):
         self.q_norm = nn.LayerNorm(self.head_dim)
         self.k_norm = nn.LayerNorm(self.head_dim)
 
-        # Bias handling
-        if bias is None:
-            initial_bias_data = torch.zeros(heads, 65, 65)
-        else:
-            initial_bias_data = bias.unsqueeze(0).repeat(heads, 1, 1)
-        
-        self.bias = nn.Parameter(initial_bias_data)
-        self.bias_scale = nn.Parameter(torch.tensor(1.0))
+        # SmolGen for dynamic bias
+        self.use_smolgen = use_smolgen
+        if use_smolgen:
+            self.smolgen = SmolGenCLS(dim, heads, latent_dim=smolgen_latent_dim, dropout_rate=smolgen_dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
+        cls_token = x[:, 0]  # Extract CLS for bias generation
         
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -150,10 +259,10 @@ class MultiHeadSelfAttention(nn.Module):
         # Compute attention
         attn = q @ k.transpose(-2, -1)
         
-        # Add bias if present
-        if self.bias is not None:
-            bias_subset = (self.bias[:, :N, :N] * self.bias_scale).to(dtype=attn.dtype, device=attn.device)
-            attn = attn + bias_subset.unsqueeze(0)
+        # Add dynamic bias from SmolGen
+        if self.use_smolgen:
+            bias = self.smolgen(cls_token)  # (B, heads, 65, 65)
+            attn = attn + bias[:, :, :N, :N]  # Handle if N < 65
         
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
@@ -162,10 +271,12 @@ class MultiHeadSelfAttention(nn.Module):
 
 class Block(nn.Module):
     """Pre-normalized Transformer encoder block (LN → MHSA → LN → SwiGLU)."""
-    def __init__(self, dim: int, heads: int, drop_path: float, bias: Optional[torch.Tensor] = None):
+    def __init__(self, dim: int, heads: int, drop_path: float, use_smolgen: bool = True, 
+                 smolgen_latent_dim: int = 256, smolgen_dropout: float = 0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim, heads, bias=bias)
+        self.attn = MultiHeadSelfAttention(dim, heads, use_smolgen=use_smolgen, 
+                                         smolgen_latent_dim=smolgen_latent_dim, smolgen_dropout=smolgen_dropout)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = SwiGLU(dim)
         self.dp = nn.Identity() if drop_path == 0 else DropPath(drop_path)
@@ -175,6 +286,50 @@ class Block(nn.Module):
         x = x + self.dp(self.attn(self.norm1(x)))
         x = x + self.dp(self.mlp(self.norm2(x)))
         return x
+
+class ValueAttentionLayer(nn.Module):
+    """Special final attention layer optimized for value/moves_left prediction."""
+    def __init__(self, dim: int, heads: int, smolgen_latent_dim: int = 256, smolgen_dropout: float = 0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attn = MultiHeadSelfAttention(dim, heads, use_smolgen=True, 
+                                         smolgen_latent_dim=smolgen_latent_dim, smolgen_dropout=smolgen_dropout)
+        # No MLP - we want to preserve features for the heads
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Simple pre-norm attention only
+        return x + self.attn(self.norm(x))
+
+class ValueHead(nn.Module):
+    """Flexible value head with spatial compression and full-dimension CLS token."""
+    def __init__(self, dim: int, num_outputs: int, spatial_compress_dim: int, 
+                 mlp_dims: List[int], dropout_rate: float = 0.1):
+        super().__init__()
+        self.spatial_compress = nn.Linear(dim, spatial_compress_dim)
+        
+        # MLP: dim (CLS) + 64 * spatial_compress_dim (Spatial) input
+        input_dim = dim + (64 * spatial_compress_dim)
+        
+        layers = []
+        current_dim = input_dim
+        for hidden_dim in mlp_dims:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            if dropout_rate > 0.0:
+                layers.append(nn.Dropout(dropout_rate))
+            current_dim = hidden_dim
+            
+        layers.append(nn.Linear(current_dim, num_outputs))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, 65, dim)
+        cls_features = x[:, 0]                                    # (B, dim)
+        spatial_features = self.spatial_compress(x[:, 1:])        # (B, 64, spatial_compress_dim)
+        spatial_flat = spatial_features.view(x.shape[0], -1)      # (B, 64 * spatial_compress_dim)
+        
+        combined = torch.cat([cls_features, spatial_flat], dim=1) # (B, dim + 64*s_c_d)
+        return self.mlp(combined)
 
 class DropPath(nn.Module):
     """Per‑sample stochastic depth."""
@@ -192,15 +347,13 @@ class DropPath(nn.Module):
 # Core model
 # ---------------------------------------------------------------------------
 class ViTChess(nn.Module):
-    """Simplified Vision‑Transformer for chess without contrastive learning.
+    """Vision‑Transformer for chess with SmolGen dynamic attention biasing.
 
-    Changes from original:
-    • Removed contrastive loss and flipped bitboard processing
-    • Removed multi-source flagging (no is_lichess)
-    • Added QK normalization in attention
-    • Switched to SwiGLU activation
-    • Implemented pre-normalization
-    • Simplified forward pass significantly
+    New features:
+    • SmolGen dynamic attention biasing replacing static distance matrix
+    • Asymmetric value/moves_left heads with different compression ratios
+    • Special value attention layer for final value/moves_left processing
+    • Configurable SmolGen parameters and head architectures
     """
     def __init__(
         self,
@@ -209,8 +362,6 @@ class ViTChess(nn.Module):
         early_depth: int = 3,
         heads: int = 8,
         drop_path: float = 0.1,
-        distance_matrix: Optional[torch.Tensor] = None,
-        freeze_distance: bool = True,
         num_policy_planes: int = 73,
         num_value_outputs: int = 3,
         num_material_categories: int = 20,
@@ -223,12 +374,22 @@ class ViTChess(nn.Module):
         cls_dropout_rate: float = 0.0,
         policy_head_conv_dim: int = 128,
         policy_head_mlp_hidden_dim: int = 256,
-        value_head_mlp_hidden_dim: Optional[int] = None,
         value_head_dropout_rate: float = 0.0,
         dim_head: Optional[int] = None,
-        value_cross_attn_summary_dim: Optional[int] = None,
-        moves_left_cross_attn_summary_dim: Optional[int] = None,
         adaptive_pool_temperature: Optional[float] = None,
+        # SmolGen parameters
+        smolgen_start_layer: int = 2,
+        smolgen_latent_dim: int = 256,
+        smolgen_dropout: float = 0.1,
+        # Value head parameters
+        value_spatial_compress_dim: int = 16,
+        value_head_mlp_dims: List[int] = [128, 64],
+        moves_left_spatial_compress_dim: int = 8,
+        moves_left_head_mlp_dims: List[int] = [128, 64],
+        # Hybrid patch embedding parameters
+        patch_resblock_hidden: int = 32,
+        patch_global_proj_dim: int = 16,
+        patch_embed_dropout: float = 0.1,
     ):
         super().__init__()
         if early_depth >= depth:
@@ -242,12 +403,17 @@ class ViTChess(nn.Module):
         self.policy_cls_projection_dim = policy_cls_projection_dim
         self.pool_every_k_blocks = pool_every_k_blocks
         self.cls_dropout_rate = cls_dropout_rate
-        self.value_cross_attn_summary_dim = value_cross_attn_summary_dim
-        self.moves_left_cross_attn_summary_dim = moves_left_cross_attn_summary_dim
         self.adaptive_pool_temperature = adaptive_pool_temperature
+        self.smolgen_start_layer = smolgen_start_layer
 
-        # Patch + position embedding
-        self.patch_embed = nn.Conv2d(NUM_BITBOARD_PLANES, dim, kernel_size=1)
+        # Hybrid patch + position embedding
+        self.patch_embed = HybridPatchEmbed(
+            in_channels=NUM_BITBOARD_PLANES,
+            resblock_hidden=patch_resblock_hidden,
+            global_proj_dim=patch_global_proj_dim,
+            out_dim=dim,
+            dropout=patch_embed_dropout
+        )
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, 65, dim))
         
@@ -257,17 +423,28 @@ class ViTChess(nn.Module):
         self.rep1_bias = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.rep2_bias = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
 
-        # Transformer encoder
+        # Transformer encoder with SmolGen
         self.blocks = nn.ModuleList()
         dp_rates = torch.linspace(0, drop_path, steps=depth)
         for i in range(depth):
-            blk = Block(dim, heads, dp_rates[i].item(), bias=distance_matrix)
-            if distance_matrix is not None and blk.attn.bias is not None:
-                blk.attn.bias.requires_grad = not freeze_distance
+            # Use SmolGen starting from specified layer (give early layers time to build representations)
+            use_smolgen = (i >= smolgen_start_layer)
+            blk = Block(
+                dim=dim,
+                heads=heads,
+                drop_path=dp_rates[i].item(),
+                use_smolgen=use_smolgen,
+                smolgen_latent_dim=smolgen_latent_dim,
+                smolgen_dropout=smolgen_dropout
+            )
             self.blocks.append(blk)
 
         # Final norm for pre-normalization architecture
         self.norm_final = nn.LayerNorm(dim)
+
+        # Add special value attention layers
+        self.early_value_attention = ValueAttentionLayer(dim, heads, smolgen_latent_dim, smolgen_dropout)
+        self.final_value_attention = ValueAttentionLayer(dim, heads, smolgen_latent_dim, smolgen_dropout)
 
         # CLS Dropout and Pooling Alphas
         self.cls_dropout = nn.Dropout(cls_dropout_rate)
@@ -283,15 +460,6 @@ class ViTChess(nn.Module):
                     self.adaptive_pools.append(AdaptivePooling(dim, temperature=self.adaptive_pool_temperature))
 
         # Prediction Heads
-        # Cross-attention layers
-        self.value_cross_attn = None
-        if self.value_cross_attn_summary_dim and self.value_cross_attn_summary_dim > 0:
-            self.value_cross_attn = ValueCrossAttention(dim, num_heads=heads, summary_dim=self.value_cross_attn_summary_dim)
-
-        self.moves_left_cross_attn = None
-        if self.moves_left_cross_attn_summary_dim and self.moves_left_cross_attn_summary_dim > 0:
-            self.moves_left_cross_attn = ValueCrossAttention(dim, num_heads=heads, summary_dim=self.moves_left_cross_attn_summary_dim)
-
         def create_value_head(input_dim: int, hidden_dim: Optional[int], output_dim: int, dropout_rate: float) -> nn.Module:
             if hidden_dim and hidden_dim > 0:
                 layers = [
@@ -306,18 +474,31 @@ class ViTChess(nn.Module):
                 return nn.Linear(input_dim, output_dim)
 
         # Early and Final Prediction Heads
-        self.early_value_head = create_value_head(dim, value_head_mlp_hidden_dim, num_value_outputs, value_head_dropout_rate)
+        self.early_value_head = ValueHead(
+            dim=dim,
+            num_outputs=num_value_outputs,
+            spatial_compress_dim=value_spatial_compress_dim, # Use same compression as final for consistency
+            mlp_dims=value_head_mlp_dims,
+            dropout_rate=value_head_dropout_rate
+        )
         self.early_material_head = nn.Linear(dim, num_material_categories)
         
-        final_value_input_dim = dim
-        if self.value_cross_attn:
-            final_value_input_dim += self.value_cross_attn_summary_dim
-        self.final_value_head = create_value_head(final_value_input_dim, value_head_mlp_hidden_dim, num_value_outputs, value_head_dropout_rate)
-
-        final_moves_left_input_dim = dim
-        if self.moves_left_cross_attn:
-            final_moves_left_input_dim += self.moves_left_cross_attn_summary_dim
-        self.final_moves_left_head = nn.Linear(final_moves_left_input_dim, num_moves_left_outputs)
+        # New flexible value heads
+        self.final_value_head = ValueHead(
+            dim=dim, 
+            num_outputs=num_value_outputs,
+            spatial_compress_dim=value_spatial_compress_dim,
+            mlp_dims=value_head_mlp_dims,
+            dropout_rate=value_head_dropout_rate
+        )
+        
+        self.final_moves_left_head = ValueHead(
+            dim=dim,
+            num_outputs=num_moves_left_outputs,
+            spatial_compress_dim=moves_left_spatial_compress_dim,
+            mlp_dims=moves_left_head_mlp_dims,
+            dropout_rate=value_head_dropout_rate
+        )
 
         # Policy Head Architecture
         self.policy_conv1 = nn.Conv2d(dim, policy_head_conv_dim, kernel_size=3, padding=1)
@@ -330,12 +511,6 @@ class ViTChess(nn.Module):
         self.policy_conv3 = nn.Conv2d(policy_head_conv_dim, num_policy_planes, kernel_size=3, padding=1)
 
         self._init_weights()
-
-    def freeze_distance_bias(self, freeze: bool = True):
-        """Convenience toggle for distance bias in all blocks."""
-        for blk in self.blocks:
-            if hasattr(blk.attn, 'bias') and blk.attn.bias is not None:
-                blk.attn.bias.requires_grad = not freeze
 
     def forward(self, bitboards: torch.Tensor, *,
                 is960: torch.Tensor,
@@ -354,10 +529,8 @@ class ViTChess(nn.Module):
         f_rep1 = rep1.float()
         f_rep2 = rep2.float()
 
-        # Patch embedding
-        x_patches_embedded = self.patch_embed(bitboards)  # (B, dim, H, W)
-        _, self.dim, H_patches, W_patches = x_patches_embedded.shape
-        x_patches_flattened = x_patches_embedded.flatten(2).transpose(1, 2)  # (B, H*W, dim)
+        # Hybrid patch embedding (already returns flattened tokens)
+        x_patches_flattened = self.patch_embed(bitboards)  # (B, 64, dim)
 
         # CLS token with biases
         cls = self.cls_token.expand(B, -1, -1)  # (B, 1, dim)
@@ -368,7 +541,7 @@ class ViTChess(nn.Module):
         cls = cls + f_rep2.view(-1, 1, 1) * self.rep2_bias
 
         # Concatenate and add positional embeddings
-        x = torch.cat([cls, x_patches_flattened], dim=1)  # (B, 1 + H*W, dim)
+        x = torch.cat([cls, x_patches_flattened], dim=1)  # (B, 1 + 64, dim)
         x = x + self.pos_embed
 
         # Transformer blocks with periodic pooling
@@ -382,13 +555,13 @@ class ViTChess(nn.Module):
 
             # Early heads application
             if (d + 1) == self.early_depth_count:
-                # Apply final norm for early outputs (since we're using pre-norm)
-                x_early = self.norm_final(x)
-                cls_token_early = self.cls_dropout(x_early[:, 0])
+                # Apply final norm and special attention layer for early outputs
+                x_early_norm = self.norm_final(x)
+                x_early_attn = self.early_value_attention(x_early_norm)
                 
-                outputs["early_value"] = self.early_value_head(cls_token_early)
-                outputs["early_material"] = self.early_material_head(cls_token_early)
-                outputs["early_cls"] = cls_token_early
+                outputs["early_value"] = self.early_value_head(x_early_attn)
+                outputs["early_material"] = self.early_material_head(x_early_norm[:, 0])
+                outputs["early_cls"] = self.cls_dropout(x_early_norm[:, 0])
 
             # Periodic pooling into CLS token
             if self.pool_every_k_blocks is not None and \
@@ -409,42 +582,36 @@ class ViTChess(nn.Module):
                 cls_updated_by_pool = cls_from_block + current_alpha * pooled_patches
                 x = torch.cat([cls_updated_by_pool, patches_from_block], dim=1)
 
-        # Final layer norm and final heads
+        # Final layer norm
         x_norm_final = self.norm_final(x)
-        cls_final_features = self.cls_dropout(x_norm_final[:, 0])
-        patch_final_features = x_norm_final[:, 1:]
 
+        # Apply special value attention layer (shared for final value and moves_left)
+        x_for_value_heads = self.final_value_attention(x_norm_final)
+
+        # Extract features for different heads
+        cls_final_features = self.cls_dropout(x_norm_final[:, 0])  # For policy
+        
         outputs["final_cls_features"] = cls_final_features
 
-        # Value Head
-        value_head_input = cls_final_features
-        if self.value_cross_attn is not None:
-            spatial_summary_value = self.value_cross_attn(cls_final_features.unsqueeze(1), patch_final_features)
-            value_head_input = torch.cat([cls_final_features, spatial_summary_value], dim=-1)
-        outputs["final_value"] = self.final_value_head(value_head_input)
+        # Apply new flexible value heads
+        outputs["final_value"] = self.final_value_head(x_for_value_heads)
+        outputs["final_moves_left"] = self.final_moves_left_head(x_for_value_heads)
 
-        # Moves Left Head
-        moves_left_head_input = cls_final_features
-        if self.moves_left_cross_attn is not None:
-            spatial_summary_moves = self.moves_left_cross_attn(cls_final_features.unsqueeze(1), patch_final_features)
-            moves_left_head_input = torch.cat([cls_final_features, spatial_summary_moves], dim=-1)
-        outputs["final_moves_left"] = self.final_moves_left_head(moves_left_head_input)
-
-        # Policy Head
-        policy_input_spatial = patch_final_features.transpose(1, 2).reshape(
-            B, self.dim, H_patches, W_patches
+        # Policy Head (continues using main network features)
+        policy_input_spatial = x_norm_final[:, 1:].transpose(1, 2).reshape(
+            B, self.dim, 8, 8
         )
 
         x_policy = F.silu(self.policy_conv1(policy_input_spatial))
         conv2_out = F.silu(self.policy_conv2(x_policy))
 
         conv2_out_flat = conv2_out.flatten(2).transpose(1, 2)
-        cls_expanded_for_bias_mlp = cls_final_features.unsqueeze(1).expand(-1, H_patches * W_patches, -1)
+        cls_expanded_for_bias_mlp = cls_final_features.unsqueeze(1).expand(-1, 64, -1)
         mlp_input = torch.cat([conv2_out_flat, cls_expanded_for_bias_mlp], dim=2)
         cls_bias_values = self.cls_bias_mlp(mlp_input)
         conv2_out_biased_flat = conv2_out_flat + cls_bias_values
         conv2_out_biased_spatial = conv2_out_biased_flat.transpose(1, 2).reshape(
-            B, -1, H_patches, W_patches
+            B, -1, 8, 8
         )
         outputs["policy"] = self.policy_conv3(conv2_out_biased_spatial)
 
@@ -453,14 +620,14 @@ class ViTChess(nn.Module):
     def _init_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.xavier_uniform_(self.patch_embed.weight)
-        if self.patch_embed.bias is not None:
-            nn.init.zeros_(self.patch_embed.bias)
+        nn.init.xavier_uniform_(self.patch_embed.initial_proj.weight)
+        if self.patch_embed.initial_proj.bias is not None:
+            nn.init.zeros_(self.patch_embed.initial_proj.bias)
 
         # Initialize heads
-        heads_to_initialize = [self.early_material_head, self.final_moves_left_head]
+        heads_to_initialize = [self.early_material_head]
 
-        for value_head_module in [self.early_value_head, self.final_value_head]:
+        for value_head_module in [self.early_value_head]:
             if isinstance(value_head_module, nn.Linear):
                 heads_to_initialize.append(value_head_module)
             elif isinstance(value_head_module, nn.Sequential):
@@ -508,20 +675,13 @@ def load_model_from_checkpoint(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 3) load distance matrix
-    dist_path = cfg['model']['distance_matrix_path']
-    distance_matrix_numpy = np.load(dist_path)
-    distance_matrix = torch.from_numpy(distance_matrix_numpy).float()
-
-    # 4) build model with exactly the same args as in your training main()
+    # 3) build model with exactly the same args as in your training main()
     model = ViTChess(
         dim=cfg['model']['dim'],
         depth=cfg['model']['depth'],
         early_depth=cfg['model']['early_depth'],
         heads=cfg['model']['heads'],
         drop_path=cfg['model'].get('drop_path', 0.1),
-        distance_matrix=distance_matrix,
-        freeze_distance=True,
         num_policy_planes=cfg['model'].get('num_policy_planes', 73),
         num_value_outputs=cfg['model'].get('num_value_outputs', 3),
         num_material_categories=cfg['model'].get('num_material_categories', 20),
@@ -534,12 +694,22 @@ def load_model_from_checkpoint(
         cls_dropout_rate=cfg['model'].get('cls_dropout_rate', 0.0),
         policy_head_conv_dim=cfg['model'].get('policy_head_conv_dim', 128),
         policy_head_mlp_hidden_dim=cfg['model'].get('policy_head_mlp_hidden_dim', 256),
-        value_head_mlp_hidden_dim=cfg['model'].get('value_head_mlp_hidden_dim'),
         value_head_dropout_rate=cfg['model'].get('value_head_dropout_rate', 0.0),
         dim_head=cfg['model'].get('dim_head'),
-        value_cross_attn_summary_dim=cfg['model'].get('value_cross_attn_summary_dim'),
-        moves_left_cross_attn_summary_dim=cfg['model'].get('moves_left_cross_attn_summary_dim'),
-        adaptive_pool_temperature=cfg['model'].get('adaptive_pool_temperature')
+        adaptive_pool_temperature=cfg['model'].get('adaptive_pool_temperature'),
+        # SmolGen parameters
+        smolgen_start_layer=cfg['model'].get('smolgen_start_layer', 2),
+        smolgen_latent_dim=cfg['model'].get('smolgen_latent_dim', 256),
+        smolgen_dropout=cfg['model'].get('smolgen_dropout', 0.1),
+        # Value head parameters
+        value_spatial_compress_dim=cfg['model'].get('value_spatial_compress_dim', 16),
+        value_head_mlp_dims=cfg['model'].get('value_head_mlp_dims', [128, 64]),
+        moves_left_spatial_compress_dim=cfg['model'].get('moves_left_spatial_compress_dim', 8),
+        moves_left_head_mlp_dims=cfg['model'].get('moves_left_head_mlp_dims', [128, 64]),
+        # Hybrid patch embedding parameters
+        patch_resblock_hidden=cfg['model'].get('patch_resblock_hidden', 32),
+        patch_global_proj_dim=cfg['model'].get('patch_global_proj_dim', 16),
+        patch_embed_dropout=cfg['model'].get('patch_embed_dropout', 0.1),
     )
     model.to(device)
 
@@ -573,8 +743,20 @@ if __name__ == "__main__":
         cls_dropout_rate=0.0,
         policy_head_conv_dim=128,
         policy_head_mlp_hidden_dim=256,
-        value_head_mlp_hidden_dim=128,
-        value_head_dropout_rate=0.1
+        value_head_dropout_rate=0.1,
+        # SmolGen parameters
+        smolgen_start_layer=2,
+        smolgen_latent_dim=256,
+        smolgen_dropout=0.1,
+        # Value head parameters
+        value_spatial_compress_dim=16,
+        value_head_mlp_dims=[128, 64],
+        moves_left_spatial_compress_dim=8,
+        moves_left_head_mlp_dims=[128, 64],
+        # Hybrid patch embedding parameters
+        patch_resblock_hidden=32,
+        patch_global_proj_dim=16,
+        patch_embed_dropout=0.1,
     )
     
     B = 2

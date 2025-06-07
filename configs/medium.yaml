@@ -3,8 +3,6 @@ model:
   depth:                 12
   early_depth:           3
   heads:                 8
-  distance_matrix_path:  dist_init.npy
-  freeze_distance_iters: 5000
   pool_every_k_blocks: 3
   cls_dropout_rate: 0.05
   cls_pool_alpha_requires_grad: true
@@ -12,12 +10,22 @@ model:
   adaptive_pool_temperature: 1.0
   policy_head_conv_dim: 784
   policy_head_mlp_hidden_dim: 784
-  value_head_mlp_hidden_dim: 512
   value_head_dropout_rate: 0.2
-  value_cross_attn_summary_dim: 256
-  moves_left_cross_attn_summary_dim: 128
   num_policy_planes: 73
   drop_path: 0.1
+  # SmolGen parameters
+  smolgen_start_layer: 2
+  smolgen_latent_dim: 256
+  smolgen_dropout: 0.1
+  # Value head parameters
+  value_spatial_compress_dim: 24
+  value_head_mlp_dims: [512, 128]
+  moves_left_spatial_compress_dim: 8
+  moves_left_head_mlp_dims: [256, 64]
+  # Hybrid patch embedding parameters
+  patch_resblock_hidden: 48
+  patch_global_proj_dim: 24
+  patch_embed_dropout: 0.1
 
 loss_weights:
   policy:           1.6
@@ -25,7 +33,6 @@ loss_weights:
   moves_left:       0.15
   auxiliary_value:  0.2   # early‐group WDL head
   material:         0.1
-  cls_sparsity:     5e-5
 
 optimiser:
   type:             adamw
@@ -56,7 +63,7 @@ runtime:
   gradient_clip_value: 5.0  # value clipping for stability
 
 logging:
-  output_dir:       ./runs/v1/medium
+  output_dir:       ./runs/v2/medium
   tensorboard:      true
   matplotlib:       true
   wandb:            false

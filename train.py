@@ -31,9 +31,11 @@ import argparse
 from typing import Optional, Dict, List, Any
 import torch.nn as nn
 import logging
+from datetime import datetime
 
 from chess_vit import ViTChess, load_model_from_checkpoint
 from chess_dataset import ChunkMmapDataset, fast_chess_collate_fn, move_batch_to_device
+from email_notifier import TrainingEmailNotifier, setup_email_logging
 
 def load_config(path: str) -> dict:
     # Ensure UTF-8 encoding when reading config to avoid locale decoding errors
@@ -355,8 +357,24 @@ def log_nan_batch(batch: Dict[str, torch.Tensor], step: int, output_dir: str):
     except Exception as e:
         print(f"Error logging NaN batch: {e}")
 
-def main(config_path: str):
+def main(config_path: str, email_address: Optional[str] = None):
     cfg = load_config(config_path)
+    
+    # Setup email notifications if email provided
+    email_notifier = None
+    training_start_time = datetime.now()
+    if email_address:
+        setup_email_logging()
+        email_notifier = TrainingEmailNotifier(
+            recipient_email=email_address,
+            send_time_hour=22,  # 10:00 PM
+            send_time_minute=0
+        )
+        if email_notifier.is_credentials_available():
+            logging.info(f"Email notifications enabled for {email_address}")
+        else:
+            logging.warning("Email address provided but credentials not available. Set TRAINING_EMAIL_SENDER and TRAINING_EMAIL_PASSWORD environment variables.")
+            email_notifier = None
     
     # Simplified type casting since we removed contrastive components
     opt_cfg = cfg['optimiser']
@@ -716,6 +734,17 @@ def main(config_path: str):
 
                 if writer and cfg['logging']['matplotlib']:
                     plot_all_losses(loss_history, val_steps_history, cfg['logging']['output_dir'])
+                
+                # Check if it's time to send daily email update
+                if email_notifier:
+                    email_notifier.send_training_update(
+                        step=step + 1,
+                        max_steps=rt['max_steps'],
+                        mean_metrics=mean_metrics,
+                        throughput=throughput,
+                        output_dir=cfg['logging']['output_dir'],
+                        training_start_time=training_start_time
+                    )
 
             # Validation step (simplified for single source)
             if (step + 1) % val_every == 0:
@@ -759,15 +788,36 @@ def main(config_path: str):
     except KeyboardInterrupt:
         print("Interrupted. Saving final checkpoint...")
         save_checkpoint(step, model, optimizer, scheduler, scaler, cfg, cfg['logging']['output_dir'])
+        
+        # Send interruption email
+        if email_notifier:
+            final_metrics = {name: np.mean(metrics[name]) if metrics[name] else 0.0 for name in metric_names}
+            email_notifier.send_training_complete_email(
+                final_step=step,
+                final_metrics=final_metrics,
+                output_dir=cfg['logging']['output_dir'],
+                training_start_time=training_start_time
+            )
     finally:
         if writer:
             if cfg['logging']['matplotlib'] and loss_history:
                 print("Generating final plots...")
                 plot_all_losses(loss_history, val_steps_history, cfg['logging']['output_dir'])
             writer.close()
+        
+        # Send completion email if training finished normally
+        if step >= rt['max_steps'] and email_notifier:
+            final_metrics = {name: np.mean(metrics[name]) if metrics[name] else 0.0 for name in metric_names}
+            email_notifier.send_training_complete_email(
+                final_step=step,
+                final_metrics=final_metrics,
+                output_dir=cfg['logging']['output_dir'],
+                training_start_time=training_start_time
+            )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Chess-ViT")
     parser.add_argument('--config', '-c', default='config.yaml', help='Path to config file')
+    parser.add_argument('--email', help='Email address for daily training updates (sent at 10:00 PM)')
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.email)

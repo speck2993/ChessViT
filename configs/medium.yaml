@@ -9,7 +9,7 @@ model:
   cls_pool_alpha_init: 1.0
   adaptive_pool_temperature: 1.0
   policy_head_conv_dim: 784
-  policy_head_mlp_hidden_dim: 784
+  policy_head_mlp_hidden_dim: 1024
   value_head_dropout_rate: 0.2
   num_policy_planes: 73
   drop_path: 0.1
@@ -28,15 +28,15 @@ model:
   patch_embed_dropout: 0.1
 
 loss_weights:
-  policy:           1.6
-  value:            1.0
+  policy:           1.0
+  value:            2.0
   moves_left:       0.15
   auxiliary_value:  0.2   # early‐group WDL head
   material:         0.1
 
 optimiser:
   type:             adamw
-  lr:               1.5e-4
+  lr:               1.7e-4
   weight_decay:     1e-2
   betas:            [0.9, 0.95]
   sched:            cosine
@@ -54,13 +54,13 @@ dataset:
 runtime:
   device:           cuda
   precision:        fp16
-  max_steps:        4200000
-  log_every:        500
-  ckpt_every:       50000
-  val_every:        20000
+  max_steps:        20000000
+  log_every:        25000
+  ckpt_every:       100000
+  val_every:        200000
   checkpoint_format: safetensors
   gradient_clip_norm: 0.5   # global‐norm clipping
-  gradient_clip_value: 5.0  # value clipping for stability
+  gradient_clip_value: 8.0  # value clipping for stability
 
 logging:
   output_dir:       ./runs/v2/medium

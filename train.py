@@ -372,6 +372,11 @@ def main(config_path: str, email_address: Optional[str] = None):
         )
         if email_notifier.is_credentials_available():
             logging.info(f"Email notifications enabled for {email_address}")
+            # Send a test email to confirm everything is working
+            email_notifier.send_start_notification(
+                config_path=config_path, 
+                max_steps=cfg['runtime']['max_steps']
+            )
         else:
             logging.warning("Email address provided but credentials not available. Set TRAINING_EMAIL_SENDER and TRAINING_EMAIL_PASSWORD environment variables.")
             email_notifier = None
@@ -712,6 +717,16 @@ def main(config_path: str, email_address: Optional[str] = None):
                 elapsed = current_time - last_log_time
                 throughput = positions / elapsed if elapsed > 0 else float('inf')
                 
+                # Get email timing status if available
+                email_status_str = ""
+                if email_notifier:
+                    try:
+                        status = email_notifier.debug_email_status()
+                        email_status_str = f"next_email: {status.get('next_email_update', 'N/A')}"
+                    except Exception as e:
+                        email_status_str = "next_email: error"
+                        logging.warning(f"Could not get email debug status: {e}")
+
                 log_str_parts = [
                     f"[Step {step+1}/{rt['max_steps']}]",
                     f"total_loss: {mean_metrics['total']:.4f}",
@@ -726,6 +741,8 @@ def main(config_path: str, email_address: Optional[str] = None):
                 ]
                 if alpha_log_str:
                     log_str_parts.append(alpha_log_str.strip(', '))
+                if email_status_str:
+                    log_str_parts.append(email_status_str)
 
                 print(", ".join(log_str_parts), flush=True)
                 
@@ -745,6 +762,10 @@ def main(config_path: str, email_address: Optional[str] = None):
                         output_dir=cfg['logging']['output_dir'],
                         training_start_time=training_start_time
                     )
+
+                # Clear CUDA cache to manage memory growth
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
             # Validation step (simplified for single source)
             if (step + 1) % val_every == 0:

@@ -63,13 +63,39 @@ class TrainingEmailNotifier:
             microsecond=0
         )
         
+        # Log current time info for debugging
+        logging.debug(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.debug(f"Target send time today: {today_send_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.debug(f"Last email date: {self.last_email_date}")
+        
         # Check if we've already sent an email today
         if self.last_email_date and self.last_email_date.date() == now.date():
+            logging.debug("Email already sent today, skipping")
             return False
         
-        # Check if current time is past the send time for today
-        # and we haven't sent an email yet today
-        return now >= today_send_time
+        # Handle edge case: if target send time was earlier today but we missed it,
+        # still send the email (e.g., training started late)
+        if now >= today_send_time:
+            logging.debug("Current time is past target send time, should send email")
+            return True
+        
+        # If it's past midnight but before the send time, check if we should send yesterday's email
+        yesterday = now - timedelta(days=1)
+        yesterday_send_time = yesterday.replace(
+            hour=self.send_time_hour,
+            minute=self.send_time_minute,
+            second=0,
+            microsecond=0
+        )
+        
+        # If we haven't sent an email since yesterday's send time and it's now past that time
+        if (self.last_email_date is None or 
+            self.last_email_date < yesterday_send_time) and now >= yesterday_send_time:
+            logging.debug("Should send yesterday's missed email")
+            return True
+        
+        logging.debug("Not time to send email yet")
+        return False
     
     def create_training_report_email(
         self,
@@ -204,16 +230,73 @@ class TrainingEmailNotifier:
         training_start_time: Optional[datetime] = None
     ) -> bool:
         """Send training update email if it's time to do so."""
+        logging.debug(f"Checking if should send email at step {step}")
+        
         if not self.should_send_email_now():
+            logging.debug("Email sending conditions not met, skipping")
             return False
+        
+        logging.info(f"Sending training update email at step {step}")
         
         try:
             msg = self.create_training_report_email(
                 step, max_steps, mean_metrics, throughput, output_dir, training_start_time
             )
-            return self.send_email(msg)
+            success = self.send_email(msg)
+            if success:
+                logging.info(f"Training update email successfully sent at step {step}")
+            else:
+                logging.error(f"Failed to send training update email at step {step}")
+            return success
         except Exception as e:
             logging.error(f"Failed to create or send training update email: {e}")
+            return False
+    
+    def send_start_notification(
+        self,
+        config_path: str,
+        max_steps: int
+    ) -> bool:
+        """Sends an email notification when training starts."""
+        if not self.is_credentials_available():
+            logging.warning("Cannot send start notification: email credentials not available.")
+            return False
+
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.sender_email
+            msg['To'] = self.recipient_email
+            msg['Subject'] = f"✅ Chess-ViT Training Run Has Started ({os.path.basename(config_path)})"
+
+            html_body = f"""
+            <html>
+            <head></head>
+            <body>
+                <h2>Chess-ViT Training Has Started</h2>
+                <p>This is a confirmation that your training run has successfully started.</p>
+                <hr>
+                
+                <h3>Configuration Details</h3>
+                <ul>
+                    <li><strong>Start Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</li>
+                    <li><strong>Config File:</strong> {config_path}</li>
+                    <li><strong>Total Steps:</strong> {max_steps:,}</li>
+                </ul>
+                
+                <p>You will receive your first scheduled update at approximately <strong>{self.send_time_hour:02d}:{self.send_time_minute:02d}</strong>.</p>
+                <p><em>Good luck with your training run!</em></p>
+            </body>
+            </html>
+            """
+            
+            msg.attach(MIMEText(html_body, 'html'))
+            
+            logging.info("Sending start-of-training notification...")
+            # Reuse the main send_email method which contains all error handling
+            return self.send_email(msg)
+            
+        except Exception as e:
+            logging.error(f"Failed to create or send start notification email: {e}")
             return False
     
     def send_training_complete_email(
@@ -289,21 +372,95 @@ class TrainingEmailNotifier:
         except Exception as e:
             logging.error(f"Failed to send training completion email: {e}")
             return False
+    
+    def debug_email_status(self) -> Dict[str, Any]:
+        """Return detailed information about email timing status for debugging."""
+        now = datetime.now()
+        today_send_time = now.replace(
+            hour=self.send_time_hour, 
+            minute=self.send_time_minute, 
+            second=0, 
+            microsecond=0
+        )
+        
+        yesterday = now - timedelta(days=1)
+        yesterday_send_time = yesterday.replace(
+            hour=self.send_time_hour,
+            minute=self.send_time_minute,
+            second=0,
+            microsecond=0
+        )
+        
+        tomorrow = now + timedelta(days=1)
+        tomorrow_send_time = tomorrow.replace(
+            hour=self.send_time_hour,
+            minute=self.send_time_minute,
+            second=0,
+            microsecond=0
+        )
+        
+        should_send = self.should_send_email_now()
+
+        status = {
+            'current_time': now.strftime('%Y-%m-%d %H:%M:%S'),
+            'timezone_note': 'Using local system time (should be UTC-7 in your case)',
+            'target_send_time_today': today_send_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'target_send_time_yesterday': yesterday_send_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'target_send_time_tomorrow': tomorrow_send_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'last_email_sent': self.last_email_date.strftime('%Y-%m-%d %H:%M:%S') if self.last_email_date else 'Never',
+            'credentials_available': self.is_credentials_available(),
+            'should_send_now': should_send,
+            'next_email_update': None,
+            'days_since_last_email': None
+        }
+        
+        # Calculate time until/since next send opportunity
+        if now >= today_send_time:
+            if should_send:
+                time_since_due = now - today_send_time
+                status['next_email_update'] = f"Overdue by {str(time_since_due).split('.')[0]}"
+            else:  # Already sent today
+                time_until = tomorrow_send_time - now
+                status['next_email_update'] = f"in {str(time_until).split('.')[0]}"
+        else:
+            # Next opportunity is today
+            time_until = today_send_time - now
+            status['next_email_update'] = f"in {str(time_until).split('.')[0]}"
+        
+        # Calculate days since last email
+        if self.last_email_date:
+            days_since = (now.date() - self.last_email_date.date()).days
+            status['days_since_last_email'] = days_since
+        
+        return status
+    
+    def print_debug_status(self):
+        """Print detailed email timing status for debugging."""
+        status = self.debug_email_status()
+        print("\n=== EMAIL NOTIFICATION DEBUG STATUS ===")
+        for key, value in status.items():
+            print(f"{key}: {value}")
+        print("=" * 40)
 
 
 def setup_email_logging():
     """Setup logging for email notifications."""
     # Create a separate logger for email notifications
     email_logger = logging.getLogger('email_notifier')
-    email_logger.setLevel(logging.INFO)
+    email_logger.setLevel(logging.DEBUG)  # Changed to DEBUG for more detailed logging
     
     # Create console handler if it doesn't exist
     if not email_logger.handlers:
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(logging.DEBUG)  # Changed to DEBUG
         formatter = logging.Formatter('[EMAIL] %(asctime)s - %(levelname)s - %(message)s')
         console_handler.setFormatter(formatter)
         email_logger.addHandler(console_handler)
+    
+    # Also set up the root logger to show email debug messages
+    root_logger = logging.getLogger()
+    if root_logger.level > logging.DEBUG:
+        root_logger.setLevel(logging.INFO)  # Ensure at least INFO level for root logger
     
     return email_logger
 

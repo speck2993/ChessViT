@@ -45,7 +45,7 @@ optimiser:
 dataset:
   data_dir:     data/train/lc0
   test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
-  batch_size:       150
+  batch_size:       128
   grad_accum:       4
   num_workers:      4
   type:             tensor

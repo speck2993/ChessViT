@@ -9,8 +9,8 @@ model:
   cls_pool_alpha_init: 1.0
   adaptive_pool_temperature: 1.0
   policy_head_conv_dim: 256
-  policy_head_mlp_hidden_dim: 512
-  value_head_dropout_rate: 0.2
+  policy_head_mlp_hidden_dim: 384
+  value_head_dropout_rate: 0.1
   num_policy_planes: 73
   drop_path: 0.1
   # SmolGen parameters
@@ -19,7 +19,7 @@ model:
   smolgen_dropout: 0.1
   # Value head parameters
   value_spatial_compress_dim: 32
-  value_head_mlp_dims: [384, 256]
+  value_head_mlp_dims: [512, 256]
   moves_left_spatial_compress_dim: 6
   moves_left_head_mlp_dims: [128, 128]
   # Hybrid patch embedding parameters
@@ -45,7 +45,7 @@ optimiser:
 dataset:
   data_dir:     data/train/lc0
   test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
-  batch_size:       900
+  batch_size:       512
   test_batch_size:  1024
   grad_accum:       4
   num_workers:      4
@@ -55,7 +55,7 @@ dataset:
 runtime:
   device:           cuda
   precision:        fp16
-  max_steps:        3000000
+  max_steps:        4500000
   log_every:        5000
   ckpt_every:       100000
   val_every:        50000

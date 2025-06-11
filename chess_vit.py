@@ -451,13 +451,6 @@ class ViTChess(nn.Module):
         # Final norm for pre-normalization architecture
         self.norm_final = nn.LayerNorm(dim)
 
-        # Strategic representation head - normalized embeddings for clustering
-        self.repr_head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, 256, bias=False),
-            nn.LayerNorm(256, elementwise_affine=False)  # L2 normalization effect
-        )
-
         # Add special value attention layers
         self.early_value_attention = ValueAttentionLayer(dim, heads, smolgen_latent_dim, smolgen_dropout)
         self.final_value_attention = ValueAttentionLayer(dim, heads, smolgen_latent_dim, smolgen_dropout)
@@ -581,8 +574,7 @@ class ViTChess(nn.Module):
                 x_early_attn = self.early_value_attention(x_early_norm)
                 
                 # Extract early strategic embedding
-                early_cls = x_early_norm[:, 0]
-                outputs["early_embedding"] = self.repr_head(early_cls)
+                outputs["early_embedding"] = x_early_norm[:, 0]
                 
                 outputs["early_value"] = self.early_value_head(x_early_attn)
                 outputs["early_material"] = self.early_material_head(x_early_norm[:, 0])
@@ -611,8 +603,7 @@ class ViTChess(nn.Module):
         x_norm_final = self.norm_final(x)
 
         # Extract final strategic embedding
-        final_cls = x_norm_final[:, 0]
-        outputs["embedding"] = self.repr_head(final_cls)
+        outputs["embedding"] = x_norm_final[:, 0]
 
         # Apply special value attention layer (shared for final value and moves_left)
         x_for_value_heads = self.final_value_attention(x_norm_final)
@@ -681,9 +672,6 @@ class ViTChess(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
-
-        # Initialize repr_head weights
-        nn.init.xavier_uniform_(self.repr_head[1].weight)
 
 def load_model_from_checkpoint(
     config_path: str,

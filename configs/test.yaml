@@ -1,20 +1,20 @@
 model:
   dim:                   96
   depth:                 6
-  early_depth:           2
+  early_depth:           1
   heads:                 6
   pool_every_k_blocks: 3
   cls_dropout_rate: 0.05
   cls_pool_alpha_requires_grad: true
   cls_pool_alpha_init: 1.0
   adaptive_pool_temperature: 1.0
-  policy_head_conv_dim: 384
-  policy_head_mlp_hidden_dim: 384
+  policy_head_conv_dim: 192
+  policy_head_mlp_hidden_dim: 256
   value_head_dropout_rate: 0.3
   num_policy_planes: 73
   drop_path: 0.1
   # SmolGen parameters
-  smolgen_start_layer: 1
+  smolgen_start_layer: 2
   smolgen_latent_dim: 64
   smolgen_dropout: 0.1
   # Value head parameters
@@ -46,6 +46,7 @@ dataset:
   data_dir:     data/train/lc0
   test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
   batch_size:       1024
+  test_batch_size:  2048
   grad_accum:       2
   num_workers:      6
   type:             tensor
@@ -61,6 +62,8 @@ runtime:
   checkpoint_format: safetensors
   gradient_clip_norm: 0.5   # global‐norm clipping
   gradient_clip_value: 5.0  # value clipping for stability
+  gradient_checkpointing: true
+  compile_model: false # Can be enabled for ~10% speedup, but uses more memory
 
 logging:
   output_dir:       ./runs/v1/test

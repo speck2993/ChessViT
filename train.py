@@ -174,10 +174,20 @@ def make_dataset(
 def save_checkpoint(step: int, model: torch.nn.Module, optimizer: optim.Optimizer,
                     scheduler: optim.lr_scheduler._LRScheduler, scaler: GradScaler,
                     cfg: dict, output_dir: str):
+    """Save checkpoint with aggressive memory management."""
     os.makedirs(output_dir, exist_ok=True)
     ckpt_prefix = os.path.join(output_dir, f"ckpt_{step:08d}")
+    
+    # Save model first
     model_path = ckpt_prefix + ".safetensors"
     save_file(model.state_dict(), model_path)
+    
+    # Clear cache after model save
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    # Save optimizer and extras
     extras = {
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
@@ -186,6 +196,17 @@ def save_checkpoint(step: int, model: torch.nn.Module, optimizer: optim.Optimize
         'config': cfg
     }
     torch.save(extras, ckpt_prefix + ".pt")
+    
+    # Aggressive cleanup
+    del extras
+    import gc
+    gc.collect()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    print(f"Checkpoint saved: {ckpt_prefix}")
 
 def plot_all_losses(loss_history_dict: Dict[str, Dict[str, Any]], 
                     val_steps_history: List[int], 
@@ -220,9 +241,15 @@ def plot_all_losses(loss_history_dict: Dict[str, Dict[str, Any]],
 def evaluate_model(model: ViTChess, device: torch.device,
                    data_source_dir: str, batch_size: int, num_workers: int,
                    tensor_glob_pattern: str, loss_weights_cfg: Dict,
-                   seed: Optional[int] = None) -> Dict[str, float]:
-    """Evaluates the model on a given dataset and returns average losses."""
+                   seed: Optional[int] = None,
+                   test_batch_size: Optional[int] = None) -> Dict[str, float]:
+    """Evaluates model with configurable test batch size."""
     print(f"Evaluating on: {data_source_dir}")
+    
+    # Use larger batch size for testing if specified
+    eval_batch_size = test_batch_size or batch_size
+    print(f"Using test batch size: {eval_batch_size}")
+    
     model.eval()
     total_loss = 0.0
     total_samples = 0
@@ -231,7 +258,7 @@ def evaluate_model(model: ViTChess, device: torch.device,
     val_loader = make_dataset(
         dataset_type='tensor',
         data_dir=data_source_dir,
-        batch_size=batch_size,
+        batch_size=eval_batch_size,
         num_workers=num_workers,
         seed=seed,
         tensor_glob_pattern=tensor_glob_pattern,
@@ -428,7 +455,7 @@ def main(config_path: str, email_address: Optional[str] = None):
         print("INFO: Training on CUDA.")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("medium")  # Faster matmuls
     else:
         device = torch.device("cpu")
         if cfg['runtime']['device'] == 'cuda':
@@ -479,17 +506,31 @@ def main(config_path: str, email_address: Optional[str] = None):
     model.to(device)
     logging.info(f"Model placed on device: {device}")
 
+    # Enable gradient checkpointing if configured
+    if cfg['runtime'].get('gradient_checkpointing', True):
+        model.enable_gradient_checkpointing()
+        print("Gradient checkpointing enabled")
+
     # Print model parameter count
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: Total={total_params/1e6:.2f}M, Trainable={trainable_params/1e6:.2f}M")
 
-    # Mixed Precision Scaler
+    # Improved mixed precision setup
     use_amp = cfg['runtime']['precision'] == 'fp16'
+    
+    # Detect best dtype for hardware
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        autocast_dtype = torch.bfloat16
+        print("Using bfloat16 for mixed precision")
+    else:
+        autocast_dtype = torch.float16
+        print("Using float16 for mixed precision")
+    
     scaler = GradScaler(enabled=use_amp)
     
     if use_amp:
-        logging.info("Mixed precision training ENABLED.")
+        logging.info(f"Mixed precision training ENABLED with {autocast_dtype}.")
     else:
         logging.info("Mixed precision training DISABLED (using fp32).")
 
@@ -563,6 +604,10 @@ def main(config_path: str, email_address: Optional[str] = None):
     val_every = rt['val_every']
     test_data_dir_from_cfg = ds_cfg['test_data_dir'] # Use dataset config for test_data_dir
 
+    # Compile model after warmup for better performance
+    compile_after_steps = 50
+    model_compiled = False
+
 
     # Asynchronous GPU prefetch
     if device.type == "cuda":
@@ -613,7 +658,7 @@ def main(config_path: str, email_address: Optional[str] = None):
                     default_flags_kwargs[flag_key] = batch.get(flag_key)
 
             # Forward + loss
-            with autocast():
+            with autocast(dtype=autocast_dtype):
                 outputs = model(
                     batch['bitboards'],
                     is960=default_flags_kwargs['is960'],
@@ -782,7 +827,8 @@ def main(config_path: str, email_address: Optional[str] = None):
                         model, device, test_base_dir,
                         ds_cfg['batch_size'], ds_cfg['num_workers'],
                         ds_cfg['tensor_glob_pattern'], cfg['loss_weights'],
-                        seed=cfg.get('seed', 42)
+                        seed=cfg.get('seed', 42),
+                        test_batch_size=ds_cfg.get('test_batch_size')
                     )
                     print(f"Validation Results (Step {step+1}):")
                     log_val_message_parts = []
@@ -803,8 +849,22 @@ def main(config_path: str, email_address: Optional[str] = None):
             # Checkpoint
             if (step + 1) % ckpt_every == 0:
                 save_checkpoint(step + 1, model, optimizer, scheduler, scaler, cfg, cfg['logging']['output_dir'])
+                # Force garbage collection after checkpoint
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
 
             step += 1
+
+            # Compile model after warmup for better performance
+            if cfg['runtime'].get('compile_model', False) and step == compile_after_steps and not model_compiled and torch.cuda.is_available():
+                try:
+                    print("Compiling model with torch.compile...")
+                    model = torch.compile(model, mode="reduce-overhead")
+                    model_compiled = True
+                    print("Model compiled successfully")
+                except Exception as e:
+                    print(f"Model compilation failed: {e}. Continuing without compilation.")
 
     except KeyboardInterrupt:
         print("Interrupted. Saving final checkpoint...")

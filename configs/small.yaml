@@ -1,15 +1,15 @@
 model:
   dim:                   256
   depth:                 8
-  early_depth:           3
+  early_depth:           2
   heads:                 8
   pool_every_k_blocks: 3
   cls_dropout_rate: 0.05
   cls_pool_alpha_requires_grad: true
   cls_pool_alpha_init: 1.0
   adaptive_pool_temperature: 1.0
-  policy_head_conv_dim: 784
-  policy_head_mlp_hidden_dim: 784
+  policy_head_conv_dim: 256
+  policy_head_mlp_hidden_dim: 512
   value_head_dropout_rate: 0.3
   num_policy_planes: 73
   drop_path: 0.1
@@ -46,6 +46,7 @@ dataset:
   data_dir:     data/train/lc0
   test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
   batch_size:       512
+  test_batch_size:  1024
   grad_accum:       3
   num_workers:      6
   type:             tensor
@@ -61,6 +62,8 @@ runtime:
   checkpoint_format: safetensors
   gradient_clip_norm: 0.5   # global‐norm clipping
   gradient_clip_value: 5.0  # value clipping for stability
+  gradient_checkpointing: true
+  compile_model: false # Can be enabled for ~10% speedup, but uses more memory
 
 logging:
   output_dir:       ./runs/v1/small

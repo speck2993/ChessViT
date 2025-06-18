@@ -10,7 +10,7 @@ model:
   adaptive_pool_temperature: 1.0
   policy_head_conv_dim:  480
   policy_head_mlp_hidden_dim: 960
-  value_head_dropout_rate: 0.2
+  value_head_dropout_rate: 0.25
   num_policy_planes:     73
   drop_path:             0.2
   # SmolGen parameters (shared module) - doesn't scale linearly

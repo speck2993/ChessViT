@@ -325,6 +325,9 @@ class ValueHead(nn.Module):
         # MLP: dim (CLS) + 64 * spatial_compress_dim (Spatial) input
         input_dim = dim + (64 * spatial_compress_dim)
         
+        # Add LayerNorm before MLP to prevent fp16 overflow
+        self.pre_mlp_norm = nn.LayerNorm(input_dim)
+        
         layers = []
         current_dim = input_dim
         for hidden_dim in mlp_dims:
@@ -344,7 +347,9 @@ class ValueHead(nn.Module):
         spatial_flat = spatial_features.view(x.shape[0], -1)      # (B, 64 * spatial_compress_dim)
         
         combined = torch.cat([cls_features, spatial_flat], dim=1) # (B, dim + 64*s_c_d)
-        return self.mlp(combined)
+        # Apply LayerNorm before MLP to prevent fp16 overflow
+        combined_normed = self.pre_mlp_norm(combined)
+        return self.mlp(combined_normed)
 
 class DropPath(nn.Module):
     """Per‑sample stochastic depth."""

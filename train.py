@@ -24,6 +24,27 @@ from losses import (
     ply_loss_fn as _ply_loss_fn,
     new_policy_loss_fn as _new_policy_loss_fn,
 )
+
+def label_smoothed_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, 
+                                 smoothing: float = 0.02) -> torch.Tensor:
+    """
+    Apply label smoothing to cross entropy loss.
+    For 3-class value targets: [1, 0, 0] -> [0.96, 0.02, 0.02]
+    """
+    num_classes = logits.size(-1)
+    confidence = 1.0 - smoothing
+    
+    # Create one-hot targets
+    one_hot = F.one_hot(targets, num_classes=num_classes).float()
+    
+    # Apply smoothing: confidence for correct class, smoothing/(num_classes-1) for others
+    smooth_targets = one_hot * confidence + (1 - one_hot) * (smoothing / (num_classes - 1))
+    
+    # Compute cross entropy with soft targets
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = -(smooth_targets * log_probs).sum(dim=-1).mean()
+    
+    return loss
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -344,9 +365,9 @@ def evaluate_model(model: ViTChess, device: torch.device,
                 target_for_loss = policy_target_from_batch.to(device=logits.device)
             
             loss_policy = _new_policy_loss_fn(target_for_loss, logits)
-            loss_value = F.cross_entropy(outputs['final_value'], batch['value_target'])
+            loss_value = label_smoothed_cross_entropy(outputs['final_value'], batch['value_target'], smoothing=0.04)
             loss_moves = _ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
-            loss_aux = F.cross_entropy(outputs['early_value'], batch['value_target'])
+            loss_aux = label_smoothed_cross_entropy(outputs['early_value'], batch['value_target'], smoothing=0.04)
             loss_material = F.cross_entropy(outputs['early_material'], batch['material_category'])
             loss_cls_sparsity = torch.tensor(0.0, device=device)
             if 'final_cls_features' in outputs:
@@ -859,9 +880,9 @@ def main(config_path: str, email_address: Optional[str] = None):
                 
                 # Compute losses
                 loss_policy = _new_policy_loss_fn(target_for_loss, logits) 
-                loss_value = F.cross_entropy(outputs['final_value'], batch['value_target'])
+                loss_value = label_smoothed_cross_entropy(outputs['final_value'], batch['value_target'], smoothing=0.04)
                 loss_moves = _ply_loss_fn(outputs['final_moves_left'], batch['ply_target'])
-                loss_aux = F.cross_entropy(outputs['early_value'], batch['value_target'])
+                loss_aux = label_smoothed_cross_entropy(outputs['early_value'], batch['value_target'], smoothing=0.04)
                 loss_material = F.cross_entropy(outputs['early_material'], batch['material_category'])
                 loss_cls_sparsity = torch.tensor(0.0, device=device)
                 if 'final_cls_features' in outputs:

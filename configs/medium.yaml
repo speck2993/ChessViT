@@ -19,7 +19,7 @@ model:
   smolgen_dropout:       0.1
   # Value head parameters
   value_spatial_compress_dim: 85     # ~6:1 compression ratio
-  value_head_mlp_dims:   [1024, 768]
+  value_head_mlp_dims:   [1024, 768, 256]
   moves_left_spatial_compress_dim: 32 # 16:1 ratio
   moves_left_head_mlp_dims: [512, 256]
   # Hybrid patch embedding parameters

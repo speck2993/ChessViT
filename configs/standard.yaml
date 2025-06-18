@@ -10,7 +10,7 @@ model:
   adaptive_pool_temperature: 1.0
   policy_head_conv_dim:  192
   policy_head_mlp_hidden_dim: 384
-  value_head_dropout_rate: 0.1
+  value_head_dropout_rate: 0.15
   num_policy_planes:     73
   drop_path:             0.1
   # SmolGen parameters (shared module)
@@ -19,7 +19,7 @@ model:
   smolgen_dropout:       0.1
   # Value head parameters
   value_spatial_compress_dim: 64     # ~6:1 compression ratio
-  value_head_mlp_dims:   [768, 512]
+  value_head_mlp_dims:   [768, 512, 128]
   moves_left_spatial_compress_dim: 24 # 16:1 ratio
   moves_left_head_mlp_dims: [384, 128]
   # Hybrid patch embedding parameters
@@ -36,7 +36,7 @@ loss_weights:
 
 optimiser:
   type:             adamw
-  lr:               1.5e-4
+  lr:               1e-4
   weight_decay:     1e-2
   betas:            [0.9, 0.95]
   sched:            cosine

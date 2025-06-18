@@ -197,6 +197,10 @@ class SmolGenCLS(nn.Module):
         self.num_heads = num_heads
         self.latent_dim = latent_dim
         
+        # Store head_dim for proper bias scaling
+        self.head_dim = dim // num_heads
+        self.bias_scale = self.head_dim ** -0.5  # Same scale as attention QK
+        
         # CLS → per-head latent with extra hidden layer for complex patterns
         self.cls_to_latent = nn.Sequential(
             nn.Linear(dim, latent_dim * 2, bias=False),
@@ -210,6 +214,9 @@ class SmolGenCLS(nn.Module):
         
         # Direct mapping to bias (simplified, no low-rank factorization)
         self.to_bias = nn.Linear(latent_dim, 65 * 65, bias=False)
+        
+        # Learnable bias temperature for adaptive scaling
+        self.bias_temperature = nn.Parameter(torch.tensor(1.0))
         
         # Initialize to near-zero for stable training
         nn.init.normal_(self.cls_to_latent[0].weight, std=0.02)
@@ -225,8 +232,14 @@ class SmolGenCLS(nn.Module):
         
         # Generate biases directly
         biases = self.to_bias(latents)  # (B, heads, 4225)
+        biases = biases.view(B, self.num_heads, 65, 65)
         
-        return biases.view(B, self.num_heads, 65, 65)
+        # Scale bias to be comparable to QK/sqrt(d) term and apply learnable temperature
+        # Clamp temperature to prevent extreme scaling
+        temp = torch.clamp(self.bias_temperature, min=0.1, max=10.0)
+        scaled_biases = biases * self.bias_scale * temp
+        
+        return scaled_biases
 
 class MultiHeadSelfAttention(nn.Module):
     """MHSA with QK normalization and optional SmolGen dynamic biasing."""
@@ -827,9 +840,15 @@ def load_model_from_checkpoint(
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
-        if "Missing key(s)" in str(e) and "shared_smolgen" in str(e):
-            print("Warning: Checkpoint may be missing shared SmolGen parameters. Attempting to load with strict=False...")
+        if "Missing key(s)" in str(e) and ("shared_smolgen" in str(e) or "bias_temperature" in str(e)):
+            print("Warning: Checkpoint may be missing shared SmolGen parameters or bias_temperature. Attempting to load with strict=False...")
             model.load_state_dict(state_dict, strict=False)
+            
+            # Initialize bias_temperature if missing
+            if hasattr(model, 'shared_smolgen') and model.shared_smolgen is not None:
+                if not hasattr(model.shared_smolgen, 'bias_temperature'):
+                    print("Initializing missing bias_temperature parameter...")
+                    model.shared_smolgen.bias_temperature = nn.Parameter(torch.tensor(1.0))
         else:
             raise
 

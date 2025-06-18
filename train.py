@@ -888,6 +888,12 @@ def main(config_path: str, email_address: Optional[str] = None):
                 if 'final_cls_features' in outputs:
                     loss_cls_sparsity = outputs['final_cls_features'].abs().mean()
 
+                # Add SmolGen bias regularization for numerical stability
+                bias_reg_loss = torch.tensor(0.0, device=device)
+                if hasattr(model, 'shared_smolgen') and model.shared_smolgen is not None:
+                    # L2 regularization on bias temperature to prevent extreme scaling
+                    bias_reg_loss = 0.001 * (model.shared_smolgen.bias_temperature - 1.0) ** 2
+                
                 # Weighted total (use pre-computed weights)
                 total_loss = (
                     lw['policy'] * loss_policy
@@ -895,6 +901,7 @@ def main(config_path: str, email_address: Optional[str] = None):
                     + lw['moves_left'] * loss_moves
                     + lw['auxiliary_value'] * loss_aux
                     + lw['material'] * loss_material
+                    + bias_reg_loss
                 )
                 compare_lc0 = (
                     loss_policy
@@ -905,6 +912,14 @@ def main(config_path: str, email_address: Optional[str] = None):
             # Check for NaN loss before backward pass
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 print(f"WARNING: NaN/Inf loss detected at step {step}. Skipping backward pass.")
+                
+                # Log SmolGen bias temperature for debugging
+                if hasattr(model, 'shared_smolgen') and model.shared_smolgen is not None:
+                    bias_temp = model.shared_smolgen.bias_temperature.item()
+                    print(f"SmolGen bias temperature: {bias_temp:.6f}")
+                    if abs(bias_temp) > 5.0:
+                        print("WARNING: SmolGen bias temperature is very large!")
+                
                 log_nan_batch(batch, step, cfg['logging']['output_dir'])
                 step += 1
                 continue  # Skip this batch entirely
@@ -919,6 +934,11 @@ def main(config_path: str, email_address: Optional[str] = None):
                 # Apply both norm and value clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), rt['gradient_clip_norm'])
                 torch.nn.utils.clip_grad_value_(model.parameters(), rt['gradient_clip_value'])
+                
+                # Additional safeguard: clamp SmolGen bias temperature to prevent runaway scaling
+                if hasattr(model, 'shared_smolgen') and model.shared_smolgen is not None:
+                    with torch.no_grad():
+                        model.shared_smolgen.bias_temperature.clamp_(0.1, 10.0)
                 
                 scaler.step(optimizer)
                 scaler.update()
@@ -954,10 +974,21 @@ def main(config_path: str, email_address: Optional[str] = None):
                         if hasattr(model, 'alphas') and model.alphas:
                             for i, alpha_param in enumerate(model.alphas):
                                 writer.add_scalar(f'alpha_pool_{i}', alpha_param.item(), step + 1)
+                        
+                        # Log SmolGen bias temperature for monitoring
+                        if hasattr(model, 'shared_smolgen') and model.shared_smolgen is not None:
+                            bias_temp = model.shared_smolgen.bias_temperature.item()
+                            writer.add_scalar('smolgen/bias_temperature', bias_temp, step + 1)
 
                     if hasattr(model, 'alphas') and model.alphas:
                         alpha_values_console = [f'{alpha_param.item():.3f}' for alpha_param in model.alphas]
                         alpha_log_str = f", alphas: [{', '.join(alpha_values_console)}]"
+                    
+                    # Add SmolGen bias temperature to console logging
+                    bias_temp_str = ""
+                    if hasattr(model, 'shared_smolgen') and model.shared_smolgen is not None:
+                        bias_temp = model.shared_smolgen.bias_temperature.item()
+                        bias_temp_str = f", bias_temp: {bias_temp:.3f}"
                     
                     current_time = time.time()
                     delta_steps = (step + 1) - last_log_step
@@ -1013,6 +1044,8 @@ def main(config_path: str, email_address: Optional[str] = None):
                     ]
                     if alpha_log_str:
                         log_str_parts.append(alpha_log_str.strip(', '))
+                    if bias_temp_str:
+                        log_str_parts.append(bias_temp_str.strip(', '))
                     if weight_info_str:
                         log_str_parts.append(weight_info_str)
                     if email_status_str:

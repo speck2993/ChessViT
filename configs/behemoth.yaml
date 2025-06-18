@@ -1,30 +1,30 @@
 model:
-  dim:                   640        # 20 heads × 32d
-  depth:                 24         # Near-optimal depth for chess
+  dim:                   960        # 30 heads × 32d
+  depth:                 26         # Diminishing returns beyond this
   early_depth:           6
-  heads:                 20
+  heads:                 30         # Near inference limit
   pool_every_k_blocks:   4
   cls_dropout_rate:      0.05
   cls_pool_alpha_requires_grad: true
   cls_pool_alpha_init:   1.0
   adaptive_pool_temperature: 1.0
-  policy_head_conv_dim:  320
-  policy_head_mlp_hidden_dim: 640
-  value_head_dropout_rate: 0.15
+  policy_head_conv_dim:  480
+  policy_head_mlp_hidden_dim: 960
+  value_head_dropout_rate: 0.2
   num_policy_planes:     73
-  drop_path:             0.15
-  # SmolGen parameters (shared module)
+  drop_path:             0.2
+  # SmolGen parameters (shared module) - doesn't scale linearly
   smolgen_start_layer:   3
-  smolgen_latent_dim:    448
+  smolgen_latent_dim:    512
   smolgen_dropout:       0.1
   # Value head parameters
-  value_spatial_compress_dim: 106    # ~6:1 compression ratio
-  value_head_mlp_dims:   [1280, 1024]
-  moves_left_spatial_compress_dim: 40 # 16:1 ratio
-  moves_left_head_mlp_dims: [640, 384]
+  value_spatial_compress_dim: 160    # ~6:1 compression ratio
+  value_head_mlp_dims:   [1920, 1536, 1024]
+  moves_left_spatial_compress_dim: 60 # 16:1 ratio
+  moves_left_head_mlp_dims: [960, 512]
   # Hybrid patch embedding parameters
-  patch_resblock_hidden: 160
-  patch_global_proj_dim: 36
+  patch_resblock_hidden: 240
+  patch_global_proj_dim: 48
   patch_embed_dropout:   0.1
 
 loss_weights:
@@ -36,7 +36,7 @@ loss_weights:
 
 optimiser:
   type:             adamw
-  lr:               3e-4
+  lr:               2e-4
   weight_decay:     1e-2
   betas:            [0.9, 0.95]
   sched:            cosine
@@ -45,10 +45,10 @@ optimiser:
 dataset:
   data_dir:     data/train/lc0
   test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
-  batch_size:       256
-  test_batch_size:  512
+  batch_size:       96
+  test_batch_size:  192
   grad_accum:       1
-  num_workers:      28
+  num_workers:      40
   type:             tensor
   tensor_glob_pattern: '*.npz'
 
@@ -59,9 +59,9 @@ runtime:
   device:           cuda
   precision:        fp16
   max_steps:        5000000
-  log_every:        410
-  ckpt_every:       164000
-  val_every:        82000
+  log_every:        425
+  ckpt_every:       170000
+  val_every:        85000
   checkpoint_format: safetensors
   gradient_clip_norm: 0.5   # global‐norm clipping
   gradient_clip_value: 5.0  # value clipping for stability
@@ -71,7 +71,7 @@ runtime:
   compile_with_cudagraphs: true # Set to true for maximum speed (requires grad_accum adjustment)
 
 logging:
-  output_dir:       ./runs/v3/large
+  output_dir:       ./runs/v3/behemoth
   tensorboard:      true
   matplotlib:       true
   wandb:            false

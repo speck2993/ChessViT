@@ -1,72 +1,74 @@
 model:
-  dim:                   96
-  depth:                 6
+  dim:                   160        # 5 heads × 32d
+  depth:                 5
   early_depth:           1
-  heads:                 6
-  pool_every_k_blocks: 3
-  cls_dropout_rate: 0.05
+  heads:                 5          # Unusual but gives exactly 32d per head
+  pool_every_k_blocks:   null       # No pooling for tiny
+  cls_dropout_rate:      0.0
   cls_pool_alpha_requires_grad: true
-  cls_pool_alpha_init: 1.0
-  adaptive_pool_temperature: 1.0
-  policy_head_conv_dim: 192
-  policy_head_mlp_hidden_dim: 256
-  value_head_dropout_rate: 0.3
-  num_policy_planes: 73
-  drop_path: 0.1
-  # SmolGen parameters
-  smolgen_start_layer: 2
-  smolgen_latent_dim: 64
-  smolgen_dropout: 0.1
+  cls_pool_alpha_init:   1.0
+  adaptive_pool_temperature: null
+  policy_head_conv_dim:  80
+  policy_head_mlp_hidden_dim: 160
+  value_head_dropout_rate: 0.05
+  num_policy_planes:     73
+  drop_path:             0.05
+  # SmolGen parameters (shared module)
+  smolgen_start_layer:   1
+  smolgen_latent_dim:    80
+  smolgen_dropout:       0.05
   # Value head parameters
-  value_spatial_compress_dim: 24
-  value_head_mlp_dims: [128, 64]
-  moves_left_spatial_compress_dim: 4
-  moves_left_head_mlp_dims: [64, 32]
+  value_spatial_compress_dim: 26     # ~6:1 compression ratio
+  value_head_mlp_dims:   [256, 128]
+  moves_left_spatial_compress_dim: 10 # 16:1 ratio
+  moves_left_head_mlp_dims: [128]
   # Hybrid patch embedding parameters
-  patch_resblock_hidden: 24
-  patch_global_proj_dim: 12
-  patch_embed_dropout: 0.1
+  patch_resblock_hidden: 40
+  patch_global_proj_dim: 10
+  patch_embed_dropout:   0.05
 
 loss_weights:
   policy:           1.0
   value:            1.6
-  moves_left:       0.15
+  moves_left:       0.2
   auxiliary_value:  0.2   # early‐group WDL head
-  material:         0.1
+  material:         0.03
 
 optimiser:
   type:             adamw
-  lr:               1.5e-4
+  lr:               2e-4
   weight_decay:     1e-2
   betas:            [0.9, 0.95]
   sched:            cosine
-  warmup_steps:     1500
+  warmup_steps:     1000
 
 dataset:
   data_dir:     data/train/lc0
   test_data_dir:    data/test/lc0    # files directly in test/ not in subdirectories
-  batch_size:       1280
-  test_batch_size:  2560
-  grad_accum:       4
-  num_workers:      5
+  batch_size:       8192
+  test_batch_size:  16384
+  grad_accum:       1
+  num_workers:      20
   type:             tensor
   tensor_glob_pattern: '*.npz'
 
 runtime:
   device:           cuda
   precision:        fp16
-  max_steps:        1500000
-  log_every:        10000
-  ckpt_every:       200000
-  val_every:        100000
+  max_steps:        100000
+  log_every:        180
+  ckpt_every:       36000
+  val_every:        18000
   checkpoint_format: safetensors
   gradient_clip_norm: 0.5   # global‐norm clipping
   gradient_clip_value: 5.0  # value clipping for stability
-  gradient_checkpointing: true
-  compile_model: false # Can be enabled for ~10% speedup, but uses more memory
+  gradient_checkpointing: false
+  compile_model: true # Can be enabled for ~10% speedup, but uses more memory
+  compile_mode: reduce-overhead # Options: default, reduce-overhead, max-autotune (slowest compile, fastest runtime)
+  compile_with_cudagraphs: false # Set to true for maximum speed (requires grad_accum adjustment)
 
 logging:
-  output_dir:       ./runs/v2/tiny
+  output_dir:       ./runs/v3/tiny
   tensorboard:      true
   matplotlib:       true
   wandb:            false

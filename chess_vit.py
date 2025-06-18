@@ -44,7 +44,7 @@ class HybridPatchEmbed(nn.Module):
         self.resblock = nn.Sequential(
             nn.Conv2d(in_channels, resblock_hidden, kernel_size=3, padding=1),
             nn.BatchNorm2d(resblock_hidden),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Conv2d(resblock_hidden, resblock_hidden, kernel_size=3, padding=1),
             nn.BatchNorm2d(resblock_hidden),
         )
@@ -57,7 +57,7 @@ class HybridPatchEmbed(nn.Module):
             nn.Sequential(
                 nn.Linear(13, global_proj_dim),
                 nn.LayerNorm(global_proj_dim),
-                nn.ReLU(inplace=True)
+                nn.ReLU()
             ) for _ in range(64)
         ])
         
@@ -102,8 +102,15 @@ class HybridPatchEmbed(nn.Module):
         B = bitboards.shape[0]
         
         # ========== Local Processing ==========
+        # Avoid tensor reuse that causes CUDA graph conflicts
+        # Clone input for one path to prevent memory aliasing
+        bitboards_for_resblock = bitboards
+        bitboards_for_proj = bitboards.clone()
+        
         # ResBlock for local pattern detection
-        local_features = self.resblock(bitboards) + self.resblock_proj(bitboards)  # (B, resblock_hidden, 8, 8)
+        resblock_out = self.resblock(bitboards_for_resblock) 
+        resblock_proj_out = self.resblock_proj(bitboards_for_proj)
+        local_features = resblock_out + resblock_proj_out  # (B, resblock_hidden, 8, 8)
         local_features = F.relu(local_features)
         
         # ========== Global Processing ==========
@@ -222,8 +229,8 @@ class SmolGenCLS(nn.Module):
         return biases.view(B, self.num_heads, 65, 65)
 
 class MultiHeadSelfAttention(nn.Module):
-    """MHSA with QK normalization and SmolGen dynamic biasing."""
-    def __init__(self, dim: int, heads: int, use_smolgen: bool = True, smolgen_latent_dim: int = 256, smolgen_dropout: float = 0.1):
+    """MHSA with QK normalization and optional SmolGen dynamic biasing."""
+    def __init__(self, dim: int, heads: int, use_smolgen: bool = True, shared_smolgen: Optional[nn.Module] = None):
         super().__init__()
         if dim % heads:
             raise ValueError("dim must be divisible by heads")
@@ -238,10 +245,9 @@ class MultiHeadSelfAttention(nn.Module):
         self.q_norm = nn.LayerNorm(self.head_dim)
         self.k_norm = nn.LayerNorm(self.head_dim)
 
-        # SmolGen for dynamic bias
-        self.use_smolgen = use_smolgen
-        if use_smolgen:
-            self.smolgen = SmolGenCLS(dim, heads, latent_dim=smolgen_latent_dim, dropout_rate=smolgen_dropout)
+        # Use shared SmolGen instance or disable
+        self.use_smolgen = use_smolgen and shared_smolgen is not None
+        self.smolgen = shared_smolgen  # Reference to shared instance
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -260,7 +266,7 @@ class MultiHeadSelfAttention(nn.Module):
         # Compute attention
         attn = q @ k.transpose(-2, -1)
         
-        # Add dynamic bias from SmolGen
+        # Add dynamic bias from shared SmolGen
         if self.use_smolgen:
             bias = self.smolgen(cls_token)  # (B, heads, 65, 65)
             attn = attn + bias[:, :, :N, :N]  # Handle if N < 65
@@ -273,11 +279,11 @@ class MultiHeadSelfAttention(nn.Module):
 class Block(nn.Module):
     """Pre-normalized Transformer encoder block (LN → MHSA → LN → SwiGLU)."""
     def __init__(self, dim: int, heads: int, drop_path: float, use_smolgen: bool = True, 
-                 smolgen_latent_dim: int = 256, smolgen_dropout: float = 0.1):
+                 shared_smolgen: Optional[nn.Module] = None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = MultiHeadSelfAttention(dim, heads, use_smolgen=use_smolgen, 
-                                         smolgen_latent_dim=smolgen_latent_dim, smolgen_dropout=smolgen_dropout)
+                                         shared_smolgen=shared_smolgen)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = SwiGLU(dim)
         self.dp = nn.Identity() if drop_path == 0 else DropPath(drop_path)
@@ -298,11 +304,11 @@ class Block(nn.Module):
 
 class ValueAttentionLayer(nn.Module):
     """Special final attention layer optimized for value/moves_left prediction."""
-    def __init__(self, dim: int, heads: int, smolgen_latent_dim: int = 256, smolgen_dropout: float = 0.1):
+    def __init__(self, dim: int, heads: int, shared_smolgen: Optional[nn.Module] = None):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.attn = MultiHeadSelfAttention(dim, heads, use_smolgen=True, 
-                                         smolgen_latent_dim=smolgen_latent_dim, smolgen_dropout=smolgen_dropout)
+                                         shared_smolgen=shared_smolgen)
         # No MLP - we want to preserve features for the heads
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -432,9 +438,15 @@ class ViTChess(nn.Module):
         self.rep1_bias = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.rep2_bias = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
 
-        # Transformer encoder with SmolGen
+        # Transformer encoder with shared SmolGen
         self.blocks = nn.ModuleList()
         dp_rates = torch.linspace(0, drop_path, steps=depth)
+        
+        # Create a single shared SmolGen instance for all layers
+        self.shared_smolgen = None
+        if smolgen_start_layer < depth:  # Only create if some layers will use it
+            self.shared_smolgen = SmolGenCLS(dim, heads, latent_dim=smolgen_latent_dim, dropout_rate=smolgen_dropout)
+        
         for i in range(depth):
             # Use SmolGen starting from specified layer (give early layers time to build representations)
             use_smolgen = (i >= smolgen_start_layer)
@@ -443,17 +455,16 @@ class ViTChess(nn.Module):
                 heads=heads,
                 drop_path=dp_rates[i].item(),
                 use_smolgen=use_smolgen,
-                smolgen_latent_dim=smolgen_latent_dim,
-                smolgen_dropout=smolgen_dropout
+                shared_smolgen=self.shared_smolgen
             )
             self.blocks.append(blk)
 
         # Final norm for pre-normalization architecture
         self.norm_final = nn.LayerNorm(dim)
 
-        # Add special value attention layers
-        self.early_value_attention = ValueAttentionLayer(dim, heads, smolgen_latent_dim, smolgen_dropout)
-        self.final_value_attention = ValueAttentionLayer(dim, heads, smolgen_latent_dim, smolgen_dropout)
+        # Add special value attention layers (also use shared SmolGen)
+        self.early_value_attention = ValueAttentionLayer(dim, heads, shared_smolgen=self.shared_smolgen)
+        self.final_value_attention = ValueAttentionLayer(dim, heads, shared_smolgen=self.shared_smolgen)
 
         # CLS Dropout and Pooling Alphas
         self.cls_dropout = nn.Dropout(cls_dropout_rate)

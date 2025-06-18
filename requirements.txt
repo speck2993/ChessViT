@@ -1,0 +1,44 @@
+# ChessViT Project Requirements
+# ================================
+
+# Core Deep Learning Framework
+torch>=2.0.0,<3.0.0
+numpy>=1.21.0,<2.0.0
+
+# Model Serialization & Checkpointing
+safetensors>=0.3.0
+
+# Configuration & Data Processing
+PyYAML>=6.0
+tqdm>=4.64.0
+
+# Chess Engine & PGN Processing
+python-chess>=1.999
+
+# Visualization & Monitoring
+matplotlib>=3.5.0
+tensorboard>=2.10.0
+
+# Email Notifications (optional)
+# These are for the email notification system
+# Can be commented out if not using email features
+
+# Development & Testing
+pytest>=7.0.0  # For running tests
+
+# Optional: Additional utilities that might be useful
+# Uncomment if needed:
+# pandas>=1.5.0       # For data analysis
+# seaborn>=0.11.0     # For enhanced plotting
+# wandb>=0.13.0       # For experiment tracking (alternative to tensorboard)
+# torchvision>=0.15.0 # If using vision utilities
+
+# Note: Standard library modules used in the project
+# (these don't need to be installed via pip):
+# - os, sys, time, random, logging, argparse
+# - pathlib, collections, typing, datetime
+# - multiprocessing, threading, concurrent.futures
+# - json, hashlib, glob, tempfile, shutil
+# - tarfile, zipfile, gzip, bz2, io
+# - smtplib, email (for email notifications)
+# - gc, math, heapq, re, queue, subprocess 

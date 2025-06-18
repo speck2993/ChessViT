@@ -75,6 +75,7 @@ class ChunkMmapDataset(IterableDataset):
         shuffle_files: bool = True,
         infinite: bool = True,
         seed: int = 0,
+        pad_partial_batches: bool = True,
     ) -> None:
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -84,6 +85,7 @@ class ChunkMmapDataset(IterableDataset):
         self.batch_size = batch_size
         self.shuffle_files = shuffle_files
         self.infinite = infinite
+        self.pad_partial_batches = pad_partial_batches
         self._rng = random.Random(seed)
 
         # Cache Setup
@@ -208,10 +210,40 @@ class ChunkMmapDataset(IterableDataset):
             n = npz[keys[0]].shape[0]
             for start in range(0, n, self.batch_size):
                 end = min(start + self.batch_size, n)
-                # Yield batch, even if it's partial. This ensures all data is seen.
+                actual_batch_size = end - start
+                
+                # Extract the batch
                 batch_data = {k: npz[k][start:end] for k in keys}
                 batch_data['source_file_basename'] = path.name
                 batch_data['original_indices_in_file'] = np.arange(start, end, dtype=np.int64)
+                
+                # Pad partial batches to target batch size for consistent tensor shapes
+                if self.pad_partial_batches and actual_batch_size < self.batch_size:
+                    padding_needed = self.batch_size - actual_batch_size
+                    
+                    # Repeat the last few samples to pad the batch
+                    for k in keys:
+                        arr = batch_data[k]
+                        if arr.ndim > 0 and len(arr) > 0:
+                            # Repeat the last samples cyclically to reach target batch size
+                            if len(arr) >= padding_needed:
+                                # Take the last padding_needed samples
+                                padding_data = arr[-padding_needed:]
+                            else:
+                                # Repeat the entire array to fill the padding
+                                repeat_count = (padding_needed + len(arr) - 1) // len(arr)
+                                repeated_data = np.tile(arr, (repeat_count,) + (1,) * (arr.ndim - 1))
+                                padding_data = repeated_data[:padding_needed]
+                            
+                            batch_data[k] = np.concatenate([arr, padding_data], axis=0)
+                    
+                    # Extend metadata arrays too
+                    original_indices = batch_data['original_indices_in_file']
+                    if len(original_indices) > 0:
+                        # For padding, mark with -1 to indicate these are duplicated samples
+                        padding_indices = np.full(padding_needed, -1, dtype=np.int64)
+                        batch_data['original_indices_in_file'] = np.concatenate([original_indices, padding_indices])
+                
                 yield batch_data
 
     def __iter__(self):

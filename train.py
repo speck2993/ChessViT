@@ -13,7 +13,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque, defaultdict
@@ -122,6 +123,20 @@ def load_config(path: str) -> dict:
         cfg['loss_weights'] = {}
     for k in cfg['loss_weights']:
         cfg['loss_weights'][k] = float(cfg['loss_weights'][k])
+    
+    # Loss weight schedules (dynamic weight adjustment)
+    if 'loss_weight_schedules' in cfg:
+        for loss_name, schedule_config in cfg['loss_weight_schedules'].items():
+            if 'start_weight' in schedule_config:
+                schedule_config['start_weight'] = float(schedule_config['start_weight'])
+            if 'end_weight' in schedule_config:
+                schedule_config['end_weight'] = float(schedule_config['end_weight'])
+            if 'decay_rate' in schedule_config:
+                schedule_config['decay_rate'] = float(schedule_config['decay_rate'])
+            if 'start_step' in schedule_config:
+                schedule_config['start_step'] = int(schedule_config['start_step'])
+            if 'duration_steps' in schedule_config:
+                schedule_config['duration_steps'] = int(schedule_config['duration_steps'])
 
     return cfg
 
@@ -140,7 +155,8 @@ def make_dataset(
     seed: Optional[int] = None,
     tensor_glob_pattern: str = "*.npz",
     shuffle_files: bool = True,
-    infinite: bool = True
+    infinite: bool = True,
+    pad_partial_batches: bool = True
     ):
     
     if dataset_type == 'tensor':
@@ -151,7 +167,8 @@ def make_dataset(
             shuffle_files=shuffle_files,
             infinite=infinite,
             seed=seed,
-            file_glob=tensor_glob_pattern
+            file_glob=tensor_glob_pattern,
+            pad_partial_batches=pad_partial_batches
         )
         dl_num_workers = num_workers
         current_collate_fn = fast_chess_collate_fn
@@ -263,13 +280,14 @@ def evaluate_model(model: ViTChess, device: torch.device,
         seed=seed,
         tensor_glob_pattern=tensor_glob_pattern,
         shuffle_files=False,
-        infinite=False
+        infinite=False,
+        pad_partial_batches=True
     )
 
-    # Calculate total batches for tqdm progress bar
+    # Calculate total batches for tqdm progress bar using the actual evaluation batch size
     total_batches = 0
     if hasattr(val_loader.dataset, 'total_positions_in_dataset') and val_loader.dataset.total_positions_in_dataset > 0:
-        total_batches = (val_loader.dataset.total_positions_in_dataset + batch_size - 1) // batch_size
+        total_batches = (val_loader.dataset.total_positions_in_dataset + eval_batch_size - 1) // eval_batch_size
     else:
         # Fallback if total_positions_in_dataset is not available or 0, progress bar will not show total
         print("Warning: Could not determine total number of batches for validation progress bar.")
@@ -383,6 +401,74 @@ def log_nan_batch(batch: Dict[str, torch.Tensor], step: int, output_dir: str):
             f.write("=" * 50 + "\n")
     except Exception as e:
         print(f"Error logging NaN batch: {e}")
+
+def compute_dynamic_loss_weights(cfg: dict, current_step: int, max_steps: int) -> Dict[str, float]:
+    """
+    Compute dynamic loss weights based on training progress.
+    
+    Args:
+        cfg: Configuration dictionary containing loss_weights and optional loss_weight_schedules
+        current_step: Current training step
+        max_steps: Total number of training steps
+        
+    Returns:
+        Dictionary of loss weight names to current weight values
+    """
+    # Start with static weights as defaults
+    weights = dict(cfg['loss_weights'])
+    
+    # Check if dynamic scheduling is configured
+    if 'loss_weight_schedules' not in cfg:
+        return weights
+    
+    schedules = cfg['loss_weight_schedules']
+    
+    for loss_name, schedule_config in schedules.items():
+        if loss_name not in weights:
+            continue
+            
+        start_weight = schedule_config.get('start_weight', weights[loss_name])
+        end_weight = schedule_config.get('end_weight', weights[loss_name])
+        schedule_type = schedule_config.get('schedule_type', 'linear')
+        
+        # New timing parameters
+        start_step = schedule_config.get('start_step', 0)
+        duration_steps = schedule_config.get('duration_steps', max_steps)
+        
+        # Calculate end step
+        end_step = start_step + duration_steps
+        
+        # Determine current weight based on timing
+        if current_step <= start_step:
+            # Before transition starts
+            weights[loss_name] = start_weight
+        elif current_step >= end_step:
+            # After transition ends
+            weights[loss_name] = end_weight
+        else:
+            # During transition - compute progress within the transition period
+            transition_progress = (current_step - start_step) / duration_steps
+            
+            # Compute interpolation factor based on schedule type
+            if schedule_type == 'linear':
+                factor = transition_progress
+            elif schedule_type == 'cosine':
+                factor = 0.5 * (1 + np.cos(np.pi * (1 - transition_progress)))  # Cosine decay
+            elif schedule_type == 'exponential':
+                decay_rate = schedule_config.get('decay_rate', 0.1)
+                factor = np.exp(-decay_rate * transition_progress * 10)  # Exponential decay
+            else:
+                factor = transition_progress  # Default to linear
+            
+            # Interpolate between start and end weights
+            if schedule_type in ['linear', 'exponential']:
+                # For linear and exponential: interpolate from start to end
+                weights[loss_name] = start_weight + factor * (end_weight - start_weight)
+            elif schedule_type == 'cosine':
+                # For cosine: smooth transition from start to end
+                weights[loss_name] = end_weight + factor * (start_weight - end_weight)
+    
+    return weights
 
 def main(config_path: str, email_address: Optional[str] = None):
     cfg = load_config(config_path)
@@ -506,15 +592,40 @@ def main(config_path: str, email_address: Optional[str] = None):
     model.to(device)
     logging.info(f"Model placed on device: {device}")
 
-    # Enable gradient checkpointing if configured
-    if cfg['runtime'].get('gradient_checkpointing', True):
+    # Automatically handle torch.compile + gradient_checkpointing conflict
+    use_compile = cfg['runtime'].get('compile_model', False)
+    use_ckpt = cfg['runtime'].get('gradient_checkpointing', True)
+    
+    if use_compile and use_ckpt:
+        print("INFO: torch.compile and gradient_checkpointing conflict detected.")
+        print("      Prioritizing torch.compile for throughput (since you're not memory-constrained).")
+        print("      Disabling gradient_checkpointing automatically.")
+        use_ckpt = False
+    
+    # Enable gradient checkpointing if appropriate
+    if use_ckpt:
         model.enable_gradient_checkpointing()
         print("Gradient checkpointing enabled")
+    else:
+        print("Gradient checkpointing disabled")
 
     # Print model parameter count
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: Total={total_params/1e6:.2f}M, Trainable={trainable_params/1e6:.2f}M")
+
+    # Display key training configuration for verification
+    print(f"Training configuration:")
+    print(f"  Max steps: {rt['max_steps']:,}")
+    print(f"  Batch size: {ds_cfg['batch_size']:,}")
+    print(f"  Log every: {rt['log_every']:,} steps")
+    print(f"  Checkpoint every: {rt['ckpt_every']:,} steps") 
+    print(f"  Validate every: {rt['val_every']:,} steps")
+    print(f"  Learning rate: {opt_cfg['lr']:.2e}")
+    if 'loss_weight_schedules' in cfg:
+        print(f"  Dynamic loss weights: {len(cfg['loss_weight_schedules'])} schedules configured")
+    else:
+        print(f"  Dynamic loss weights: None (using static weights)")
 
     # Improved mixed precision setup
     use_amp = cfg['runtime']['precision'] == 'fp16'
@@ -538,8 +649,53 @@ def main(config_path: str, email_address: Optional[str] = None):
     if hasattr(torch, 'compile') and cfg['runtime'].get('compile_model', False):
         try:
             logging.info("Attempting to compile model with torch.compile()...")
-            model = torch.compile(model)
-            logging.info("Model compiled successfully.")
+            
+            # Configure compiler for stability
+            torch._dynamo.config.suppress_errors = True
+            torch._dynamo.config.cache_size_limit = 64
+            
+            # Get compilation mode and CUDA graph settings
+            compile_mode = cfg['runtime'].get('compile_mode', 'default')
+            original_grad_accum = ds_cfg['grad_accum']
+            enable_cudagraphs = cfg['runtime'].get('compile_with_cudagraphs', False)
+            
+            if enable_cudagraphs and torch.cuda.is_available():
+                # CUDA graphs require grad_accum=1 for memory safety
+                if original_grad_accum > 1:
+                    logging.info(f"CUDA graphs enabled: adjusting grad_accum from {original_grad_accum} to 1")
+                    logging.info("Learning rate will be scaled proportionally to maintain effective batch size")
+                    ds_cfg['grad_accum'] = 1
+                    # Scale learning rate to maintain effective batch size
+                    opt_cfg['lr'] *= original_grad_accum
+                    logging.info(f"Scaled learning rate to {opt_cfg['lr']:.2e}")
+                
+                # Enable CUDA graphs with specified mode
+                if compile_mode == 'max-autotune':
+                    logging.info("Using max-autotune mode for maximum performance (longer compilation time)")
+                    model = torch.compile(model, mode="max-autotune")
+                else:
+                    model = torch.compile(model, mode="reduce-overhead")
+                logging.info(f"Model compiled successfully with CUDA graphs enabled (mode: {compile_mode}).")
+            else:
+                # Disable CUDA graphs for safer async prefetch compatibility  
+                if torch.cuda.is_available():
+                    torch._inductor.config.triton.cudagraphs = False
+                    logging.info("Disabled CUDA graphs for safer async prefetch compatibility.")
+                
+                # Use custom options for safety
+                if compile_mode == 'max-autotune':
+                    logging.info("Using max-autotune mode for maximum performance (longer compilation time)")
+                    model = torch.compile(
+                        model,
+                        mode="max-autotune",
+                        options={"triton.cudagraphs": False}  # Disable CUDA graphs for safety
+                    )
+                else:
+                    model = torch.compile(
+                        model,
+                        options={"triton.cudagraphs": False}  # Disable CUDA graphs for safety
+                    )
+                logging.info(f"Model compiled successfully with CUDA graph safety measures (mode: {compile_mode}).")
         except Exception as e:
             logging.warning(f"torch.compile failed: {e}. Proceeding with uncompiled model.")
   
@@ -574,7 +730,8 @@ def main(config_path: str, email_address: Optional[str] = None):
         seed=cfg.get('seed', 42),
         tensor_glob_pattern=ds_cfg['tensor_glob_pattern'],
         shuffle_files=True,
-        infinite=True
+        infinite=True,
+        pad_partial_batches=cfg.get('pad_partial_batches', True)
     )
     data_iter = iter(loader)
 
@@ -604,11 +761,6 @@ def main(config_path: str, email_address: Optional[str] = None):
     val_every = rt['val_every']
     test_data_dir_from_cfg = ds_cfg['test_data_dir'] # Use dataset config for test_data_dir
 
-    # Compile model after warmup for better performance
-    compile_after_steps = 50
-    model_compiled = False
-
-
     # Asynchronous GPU prefetch
     if device.type == "cuda":
         prefetch_stream = torch.cuda.Stream(device=device)
@@ -632,6 +784,12 @@ def main(config_path: str, email_address: Optional[str] = None):
             model.train()
             if step % grad_accum == 0:
                 optimizer.zero_grad(set_to_none=True)
+
+            # Mark CUDA graph step boundary for memory safety
+            if torch.cuda.is_available() and hasattr(torch.compiler, 'cudagraph_mark_step_begin'):
+                # Only needed when CUDA graphs are disabled due to gradient accumulation
+                if not cfg['runtime'].get('compile_with_cudagraphs', False) or ds_cfg['grad_accum'] > 1:
+                    torch.compiler.cudagraph_mark_step_begin()
 
             # Get current prefetched batch & prefetch next
             if prefetch_stream is not None:
@@ -657,8 +815,11 @@ def main(config_path: str, email_address: Optional[str] = None):
                 else:
                     default_flags_kwargs[flag_key] = batch.get(flag_key)
 
+            # Compute dynamic loss weights OUTSIDE autocast to prevent recompilation
+            lw = compute_dynamic_loss_weights(cfg, step, rt['max_steps'])
+            
             # Forward + loss
-            with autocast(dtype=autocast_dtype):
+            with autocast(device_type='cuda', dtype=autocast_dtype):
                 outputs = model(
                     batch['bitboards'],
                     is960=default_flags_kwargs['is960'],
@@ -690,8 +851,7 @@ def main(config_path: str, email_address: Optional[str] = None):
                 if 'final_cls_features' in outputs:
                     loss_cls_sparsity = outputs['final_cls_features'].abs().mean()
 
-                # Weighted total (simplified without contrastive)
-                lw = cfg['loss_weights']
+                # Weighted total (use pre-computed weights)
                 total_loss = (
                     lw['policy'] * loss_policy
                     + lw['value'] * loss_value
@@ -738,84 +898,121 @@ def main(config_path: str, email_address: Optional[str] = None):
 
             # Logging
             if (step + 1) % log_every == 0:
-                mean_metrics = {name: np.mean(metrics[name]) for name in metric_names}
-                mean_data_loading_time = np.mean(data_loading_times)
-                alpha_log_str = ""
+                try:
+                    mean_metrics = {name: np.mean(metrics[name]) for name in metric_names}
+                    mean_data_loading_time = np.mean(data_loading_times)
+                    alpha_log_str = ""
 
-                if writer:
-                    for name, val in mean_metrics.items():
-                        loss_history[name]['train'].append(val)
-                        loss_history[name]['steps_train'].append(step + 1)
-                        writer.add_scalar(f'train/{name}', val, step + 1)
-                    
+                    if writer:
+                        for name, val in mean_metrics.items():
+                            loss_history[name]['train'].append(val)
+                            loss_history[name]['steps_train'].append(step + 1)
+                            writer.add_scalar(f'train/{name}', val, step + 1)
+                        
+                        # Log current dynamic loss weights
+                        current_weights = compute_dynamic_loss_weights(cfg, step, rt['max_steps'])
+                        for weight_name, weight_val in current_weights.items():
+                            writer.add_scalar(f'loss_weights/{weight_name}', weight_val, step + 1)
+                        
+                        if hasattr(model, 'alphas') and model.alphas:
+                            for i, alpha_param in enumerate(model.alphas):
+                                writer.add_scalar(f'alpha_pool_{i}', alpha_param.item(), step + 1)
+
                     if hasattr(model, 'alphas') and model.alphas:
-                        for i, alpha_param in enumerate(model.alphas):
-                            writer.add_scalar(f'alpha_pool_{i}', alpha_param.item(), step + 1)
+                        alpha_values_console = [f'{alpha_param.item():.3f}' for alpha_param in model.alphas]
+                        alpha_log_str = f", alphas: [{', '.join(alpha_values_console)}]"
+                    
+                    current_time = time.time()
+                    delta_steps = (step + 1) - last_log_step
+                    positions = delta_steps * ds_cfg['batch_size']
+                    elapsed = current_time - last_log_time
+                    throughput = positions / elapsed if elapsed > 0 else float('inf')
+                    
+                    # Get email timing status if available
+                    email_status_str = ""
+                    if email_notifier:
+                        try:
+                            status = email_notifier.debug_email_status()
+                            email_status_str = f"next_email: {status.get('next_email_update', 'N/A')}"
+                        except Exception as e:
+                            email_status_str = "next_email: error"
+                            logging.warning(f"Could not get email debug status: {e}")
 
-                if hasattr(model, 'alphas') and model.alphas:
-                    alpha_values_console = [f'{alpha_param.item():.3f}' for alpha_param in model.alphas]
-                    alpha_log_str = f", alphas: [{', '.join(alpha_values_console)}]"
-                
-                current_time = time.time()
-                delta_steps = (step + 1) - last_log_step
-                positions = delta_steps * ds_cfg['batch_size']
-                elapsed = current_time - last_log_time
-                throughput = positions / elapsed if elapsed > 0 else float('inf')
-                
-                # Get email timing status if available
-                email_status_str = ""
-                if email_notifier:
-                    try:
-                        status = email_notifier.debug_email_status()
-                        email_status_str = f"next_email: {status.get('next_email_update', 'N/A')}"
-                    except Exception as e:
-                        email_status_str = "next_email: error"
-                        logging.warning(f"Could not get email debug status: {e}")
+                    # Add dynamic weight info to console output
+                    weight_info_str = ""
+                    if 'loss_weight_schedules' in cfg:
+                        current_weights = compute_dynamic_loss_weights(cfg, step, rt['max_steps'])
+                        weight_parts = []
+                        for loss_name in ['value', 'moves_left', 'material']:
+                            if loss_name in cfg['loss_weight_schedules']:
+                                # Add phase indicator 
+                                schedule = cfg['loss_weight_schedules'][loss_name]
+                                start_step = schedule.get('start_step', 0)
+                                duration_steps = schedule.get('duration_steps', rt['max_steps'])
+                                end_step = start_step + duration_steps
+                                
+                                if step <= start_step:
+                                    phase = "pre"
+                                elif step >= end_step:
+                                    phase = "post"
+                                else:
+                                    phase = "active"
+                                
+                                weight_parts.append(f"{loss_name}={current_weights[loss_name]:.3f}({phase})")
+                        if weight_parts:
+                            weight_info_str = f"weights: {', '.join(weight_parts)}"
 
-                log_str_parts = [
-                    f"[Step {step+1}/{rt['max_steps']}]",
-                    f"total_loss: {mean_metrics['total']:.4f}",
-                    f"lc0_loss: {mean_metrics['compare_lc0']:.4f}",
-                    f"policy: {mean_metrics['policy']:.4f}",
-                    f"value: {mean_metrics['value']:.4f}",
-                    f"moves_left: {mean_metrics['moves_left']:.4f}",
-                    f"aux_val: {mean_metrics['auxiliary_value']:.4f}",
-                    f"material: {mean_metrics['material']:.4f}",
-                    f"{throughput:.1f} pos/s",
-                    f"data_load: {mean_data_loading_time:.4f}s"
-                ]
-                if alpha_log_str:
-                    log_str_parts.append(alpha_log_str.strip(', '))
-                if email_status_str:
-                    log_str_parts.append(email_status_str)
+                    log_str_parts = [
+                        f"[Step {step+1}/{rt['max_steps']}]",
+                        f"total_loss: {mean_metrics['total']:.4f}",
+                        f"lc0_loss: {mean_metrics['compare_lc0']:.4f}",
+                        f"policy: {mean_metrics['policy']:.4f}",
+                        f"value: {mean_metrics['value']:.4f}",
+                        f"moves_left: {mean_metrics['moves_left']:.4f}",
+                        f"aux_val: {mean_metrics['auxiliary_value']:.4f}",
+                        f"material: {mean_metrics['material']:.4f}",
+                        f"{throughput:.1f} pos/s",
+                        f"data_load: {mean_data_loading_time:.4f}s"
+                    ]
+                    if alpha_log_str:
+                        log_str_parts.append(alpha_log_str.strip(', '))
+                    if weight_info_str:
+                        log_str_parts.append(weight_info_str)
+                    if email_status_str:
+                        log_str_parts.append(email_status_str)
 
-                print(", ".join(log_str_parts), flush=True)
-                
-                last_log_time = current_time
-                last_log_step = step + 1
+                    print(", ".join(log_str_parts), flush=True)
+                    
+                    last_log_time = current_time
+                    last_log_step = step + 1
 
-                if writer and cfg['logging']['matplotlib']:
-                    plot_all_losses(loss_history, val_steps_history, cfg['logging']['output_dir'])
-                
-                # Check if it's time to send daily email update
-                if email_notifier:
-                    email_notifier.send_training_update(
-                        step=step + 1,
-                        max_steps=rt['max_steps'],
-                        mean_metrics=mean_metrics,
-                        throughput=throughput,
-                        output_dir=cfg['logging']['output_dir'],
-                        training_start_time=training_start_time
-                    )
+                    if writer and cfg['logging']['matplotlib']:
+                        plot_all_losses(loss_history, val_steps_history, cfg['logging']['output_dir'])
+                    
+                    # Check if it's time to send daily email update
+                    if email_notifier:
+                        email_notifier.send_training_update(
+                            step=step + 1,
+                            max_steps=rt['max_steps'],
+                            mean_metrics=mean_metrics,
+                            throughput=throughput,
+                            output_dir=cfg['logging']['output_dir'],
+                            training_start_time=training_start_time
+                        )
 
-                # Clear CUDA cache to manage memory growth
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
+                    # Clear CUDA cache to manage memory growth
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                        
+                except Exception as e:
+                    print(f"ERROR in logging section at step {step+1}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # Validation step (simplified for single source)
             if (step + 1) % val_every == 0:
                 print(f"\n--- Starting Validation at Step {step+1} ---")
-                original_model_training_state = model.training
+                was_training = model.training
                 model.eval()
 
                 test_base_dir = test_data_dir_from_cfg
@@ -823,10 +1020,12 @@ def main(config_path: str, email_address: Optional[str] = None):
                     print(f"Warning: Test data directory {test_base_dir} not found. Skipping validation.")
                 else:
                     val_steps_history.append(step + 1)
+                    # Use current dynamic loss weights for validation too
+                    current_val_weights = compute_dynamic_loss_weights(cfg, step, rt['max_steps'])
                     avg_val_losses = evaluate_model(
                         model, device, test_base_dir,
                         ds_cfg['batch_size'], ds_cfg['num_workers'],
-                        ds_cfg['tensor_glob_pattern'], cfg['loss_weights'],
+                        ds_cfg['tensor_glob_pattern'], current_val_weights,
                         seed=cfg.get('seed', 42),
                         test_batch_size=ds_cfg.get('test_batch_size')
                     )
@@ -840,7 +1039,7 @@ def main(config_path: str, email_address: Optional[str] = None):
                             log_val_message_parts.append(f"{loss_n}: {loss_v:.4f}")
                     print("  " + ", ".join(log_val_message_parts))
                 
-                if original_model_training_state:
+                if was_training:
                     model.train()
                 print(f"--- Finished Validation at Step {step+1} ---\n")
 
@@ -856,15 +1055,7 @@ def main(config_path: str, email_address: Optional[str] = None):
 
             step += 1
 
-            # Compile model after warmup for better performance
-            if cfg['runtime'].get('compile_model', False) and step == compile_after_steps and not model_compiled and torch.cuda.is_available():
-                try:
-                    print("Compiling model with torch.compile...")
-                    model = torch.compile(model, mode="reduce-overhead")
-                    model_compiled = True
-                    print("Model compiled successfully")
-                except Exception as e:
-                    print(f"Model compilation failed: {e}. Continuing without compilation.")
+
 
     except KeyboardInterrupt:
         print("Interrupted. Saving final checkpoint...")

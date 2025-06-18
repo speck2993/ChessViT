@@ -195,9 +195,25 @@ def save_checkpoint(step: int, model: torch.nn.Module, optimizer: optim.Optimize
     os.makedirs(output_dir, exist_ok=True)
     ckpt_prefix = os.path.join(output_dir, f"ckpt_{step:08d}")
     
-    # Save model first
+    # Save model first - handle compiled models properly
     model_path = ckpt_prefix + ".safetensors"
-    save_file(model.state_dict(), model_path)
+    try:
+        # Get the state dict - this will use our custom state_dict method
+        state_dict = model.state_dict()
+        save_file(state_dict, model_path)
+    except RuntimeError as e:
+        if "share memory" in str(e):
+            print(f"Warning: Shared memory error during save. Attempting to use uncompiled model state dict...")
+            # If the model is compiled, try to get the original module's state dict
+            if hasattr(model, '_orig_mod'):
+                state_dict = model._orig_mod.state_dict()
+            else:
+                # Fallback: copy the state dict to break references
+                state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+            save_file(state_dict, model_path)
+            print(f"Successfully saved model using fallback method")
+        else:
+            raise
     
     # Clear cache after model save
     if torch.cuda.is_available():

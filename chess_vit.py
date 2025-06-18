@@ -532,6 +532,79 @@ class ViTChess(nn.Module):
 
         self._init_weights()
 
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        """Custom state_dict to handle shared SmolGen module properly."""
+        # Use the newer kwargs syntax to avoid the FutureWarning
+        state_dict = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+        
+        # Remove duplicate SmolGen parameters from individual attention layers
+        # Keep only the main shared_smolgen parameters
+        if hasattr(self, 'shared_smolgen') and self.shared_smolgen is not None:
+            keys_to_remove = []
+            
+            # Handle both regular and compiled model prefixes
+            possible_smolgen_prefixes = [
+                f"{prefix}shared_smolgen.",
+                f"{prefix}_orig_mod.shared_smolgen."
+            ]
+            
+            for key in state_dict.keys():
+                # Check if this is a SmolGen parameter from an individual layer
+                if '.attn.smolgen.' in key and any(param_name in key for param_name in ['cls_to_latent', 'to_bias']):
+                    # Don't remove if it's the main shared_smolgen
+                    is_main_smolgen = any(key.startswith(prefix_candidate) for prefix_candidate in possible_smolgen_prefixes)
+                    if not is_main_smolgen:
+                        keys_to_remove.append(key)
+            
+            if keys_to_remove:
+                print(f"Removing {len(keys_to_remove)} duplicate SmolGen parameters from state dict:")
+                for key in keys_to_remove[:5]:  # Print first few for debugging
+                    print(f"  - {key}")
+                if len(keys_to_remove) > 5:
+                    print(f"  ... and {len(keys_to_remove) - 5} more")
+                
+                for key in keys_to_remove:
+                    del state_dict[key]
+        
+        return state_dict
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """Custom load_state_dict to handle shared SmolGen module properly."""
+        # Create a copy of the state dict and add the missing SmolGen parameters
+        # by copying them from the shared_smolgen to individual layers
+        modified_state_dict = dict(state_dict)
+        
+        if hasattr(self, 'shared_smolgen') and self.shared_smolgen is not None:
+            # Find the shared SmolGen parameters
+            shared_smolgen_params = {}
+            for key, value in state_dict.items():
+                if key.startswith('shared_smolgen.') or key.startswith('_orig_mod.shared_smolgen.'):
+                    # Extract the parameter name (e.g., 'cls_to_latent.0.weight')
+                    if key.startswith('_orig_mod.shared_smolgen.'):
+                        param_name = key[len('_orig_mod.shared_smolgen.'):]
+                    else:
+                        param_name = key[len('shared_smolgen.'):]
+                    shared_smolgen_params[param_name] = value
+            
+            if shared_smolgen_params:
+                # Now populate the missing individual layer parameters
+                missing_keys = []
+                for layer_name in self.state_dict().keys():
+                    if '.attn.smolgen.' in layer_name and layer_name not in modified_state_dict:
+                        # Extract the SmolGen parameter name from the layer path
+                        # e.g., 'blocks.2.attn.smolgen.cls_to_latent.0.weight' -> 'cls_to_latent.0.weight'
+                        parts = layer_name.split('.attn.smolgen.')
+                        if len(parts) == 2:
+                            param_name = parts[1]
+                            if param_name in shared_smolgen_params:
+                                modified_state_dict[layer_name] = shared_smolgen_params[param_name]
+                                missing_keys.append(layer_name)
+                
+                if missing_keys:
+                    print(f"Populated {len(missing_keys)} missing SmolGen parameters from shared module")
+        
+        return super().load_state_dict(modified_state_dict, strict=strict)
+
     def enable_gradient_checkpointing(self):
         """Enable gradient checkpointing for memory efficiency."""
         for block in self.blocks:
@@ -746,7 +819,14 @@ def load_model_from_checkpoint(
 
     # 5) restore weights from safetensors
     state_dict = load_file(checkpoint_prefix + ".safetensors", device=str(device))
-    model.load_state_dict(state_dict)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        if "Missing key(s)" in str(e) and "shared_smolgen" in str(e):
+            print("Warning: Checkpoint may be missing shared SmolGen parameters. Attempting to load with strict=False...")
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            raise
 
     # 6) switch to eval mode
     model.eval()
